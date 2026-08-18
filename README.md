@@ -11,12 +11,29 @@ contributions **is** the pooled marginal log-likelihood and its gradient, so the
 optimum is the pooled `fit_model` optimum, not an approximation of it. This is exact
 federated NLME, not an averaging heuristic.
 
+## The data
+
+The default demo federates the **real** warfarin PK data, loaded through NoLimits' own
+`load_warfarin_from_monolix()`: the Monolix tutorial dataset of single-dose oral warfarin,
+32 dosed subjects of which the loader returns the 30 that carry its required baseline
+record. The PK rows are the ones with a non-missing concentration `C`, giving **227
+observations from 30 subjects**, mapped to the model's columns as `ID=id`, `t`, `Dose=d`
+(the per-subject dose, 60 to 153 mg) and `conc=C`. Subjects are split into 3 contiguous
+sites of 10.
+
+The first run downloads the file and caches the raw frame at `data/warfarin.csv`
+(gitignored); every later run and every test reads the cache, so repeat runs are offline.
+
+The seeded synthetic data set is still there behind `data-source="simulated"`: 24 subjects
+at TRUE_THETA, split 8/8/8. It powers the fast tests and the fault-injection test, and it
+is the only mode with a known true theta, so it is where the additivity of the site
+quantities is checked.
+
 ## The model
 
-The demo federates a warfarin population PK model: a single 100 mg oral dose, one
-compartment with first-order absorption, and multiplicative log-normal random effects on
-absorption rate, clearance and volume. It is the same shape as the theophylline example in
-NoLimitsPy, with warfarin-typical values (`ka` 1/h, `cl` L/h, `v` L, concentrations mg/L).
+The model is a warfarin population PK model: single oral dose, one compartment with
+first-order absorption, and multiplicative log-normal random effects on absorption rate,
+clearance and volume (`ka` 1/h, `cl` L/h, `v` L, concentrations mg/L).
 
 ```julia
 @fixedEffects begin
@@ -62,8 +79,8 @@ end
 end
 ```
 
-Twenty-four subjects are sampled at 0.5, 1, 2, 4, 8, 24, 36, 48, 72, 96 and 120 h. The
-random effects enter nonlinearly and the parameters mix scales (the structural parameters
+The real data are sampled irregularly from 0.5 to 120 h; the simulated mode uses 0.5, 1,
+2, 4, 8, 24, 36, 48, 72, 96 and 120 h. The random effects enter nonlinearly and the parameters mix scales (the structural parameters
 are plain, the variance parameters are `scale=:log`), which is the realistic case for the
 federated gradient: this is a genuine ODE mixed-effects fit, not a linear toy. The ODE is
 linear in the states, so NoLimits takes its closed-form fast path and one site objective
@@ -74,28 +91,29 @@ plus gradient evaluation costs about 50 ms after compilation.
 A run is one prepare round followed by pure evaluation rounds.
 
 **Round 0, prepare.** The server broadcasts the run configuration to every site. Each site
-builds its own `DataModel` and burns one throwaway `objective_and_gradient` call at the
+builds its own `DataModel` and `FitContext` and burns one throwaway `objective_and_gradient` call at the
 model's default theta, then replies with a ready flag, its setup wall time, its subject
 count, its parameter names and the model-default transformed theta0. This is where the
-one-off cost lives: Julia boot plus model codegen plus the first evaluation is about 85 s
-per site, against about 0.05 s for a warm one. Paying it in a round of its own keeps it out
+one-off cost lives: Julia boot plus model codegen plus the first evaluation is about 82 s
+per site, against about 0.1 s for a warm round (2.6 ms of it the actual site call, the
+rest messaging). Paying it in a round of its own keeps it out
 of optimization round 1 and makes it visible in the log:
 
 ```
 PREPARE ROUND (3 sites)
   site   subjects      setup (s)
-  0             8           84.9
-  1             8           85.3
-  2             8           82.4
+  0            10           81.3
+  1            10           81.1
+  2            10           81.7
 ```
 
 Caveat specific to the *simulation* runtime: Ray's ClientAppActors are not pinned to a
-node, so with fewer actors than sites (`init-args-num-cpus=2`, 3 sites) one actor serves
-several partitions and pays a build for each partition it has not seen yet. Measured: after
-a 170 s prepare round, round 1 still cost 129 s and every round after it 0.1 s. Give each
-site its own actor (`init-args-num-cpus` >= number of sites) if you want the prepare round
-to absorb all of it. In deployment the question does not arise: one SuperNode per site, one
-process, one DataModel.
+node, so an actor can be handed a partition it has not built yet and pays the build then.
+Measured on the warfarin run with one CPU per site (`init-args-num-cpus=3`): after a 108 s
+prepare round the warm rounds cost 0.10 to 0.22 s, but rounds 1, 3 and 4 still cost about
+63 s each. More actors reduce that, they do not eliminate it. In deployment the question
+does not arise: one SuperNode per site, one process, one DataModel, one FitContext, and the
+prepare round absorbs the whole setup cost.
 
 The server asserts that every site reports ready and that all sites report *identical*
 names and theta0 (they run the same model, so a mismatch means they do not, and the summed
@@ -105,9 +123,12 @@ needs no Julia at all for the optimization.
 **Every following round** is one L-BFGS-B objective evaluation:
 
 1. The server broadcasts the current transformed-scale theta to every site.
-2. Each site computes `objective_and_gradient(Laplace(), dm_site, theta)` over its own
-   subjects (the Laplace marginal likelihood finds its own empirical-Bayes modes) on its
-   already-warm DataModel and replies with the scalar value and the gradient vector.
+2. Each site computes `objective_and_gradient(Laplace(), ctx_site, theta)` over its own
+   subjects (the Laplace marginal likelihood finds its own empirical-Bayes modes) through
+   the `FitContext` built in the prepare round, and replies with the scalar value and the
+   gradient vector. The context caches the random-effect batch infos and the evaluation
+   cache: on one warfarin site that is 2.6 ms per call against 17.6 ms for the equivalent
+   `DataModel` call, which rebuilds them every time. Both forms return the same numbers.
 3. The server sums the values and the gradients and hands them to L-BFGS-B (`jac=True`).
 
 Theta crosses the wire on the transformed (unconstrained) scale, so positivity constraints
@@ -121,34 +142,40 @@ a per-site E-step sufficient-statistics primitive upstream in NoLimits.
 
 ## Equivalence, measured
 
-Federated fit versus the pooled `fit_model` on the same simulated data, 24 subjects split
-into 3 sites of 8, same model, same start point. Acceptance enforced by the run: objective
-within 1e-6 relative, every natural-scale parameter within 1e-3 relative.
+Federated fit versus the pooled `fit_model` on the same data, same model, same start point
+(the model's default theta, agreed in the prepare round). Acceptance enforced by the run:
+objective within 1e-6 relative, every natural-scale parameter within 1e-3 relative.
 
-| data-seed | rounds | wall | federated loglik | pooled loglik | loglik rel.diff | worst parameter rel.diff |
-|---|---|---|---|---|---|---|
-| 20260818 | 45 | 286.8 s | -324.1753622672 | -324.1753625815 | 9.7e-10 | 1.2e-04 (omega_ka) |
-| 20260819 | 43 | 302.1 s | -335.5802494858 | -335.5802492634 | 6.6e-10 | 1.0e-04 (omega_v) |
+| data-source | sites | subjects | rounds | wall | federated loglik | pooled loglik | loglik rel.diff | worst parameter rel.diff |
+|---|---|---|---|---|---|---|---|---|
+| `warfarin` (real) | 3 | 10/10/10 | 85 | 263.9 s | -403.2872861703 | -403.2872858633 | 7.6e-10 | 1.8e-04 (omega_ka) |
+| `simulated` | 3 | 8/8/8 | 45 | 199.5 s | -324.1753630917 | -324.1753625815 | 1.6e-09 | 2.2e-04 (sigma) |
 
-Per-parameter for seed 20260818:
+Per-parameter on the real warfarin data:
 
 | parameter | federated | pooled | rel.diff |
 |---|---|---|---|
-| ka | 1.00529192 | 1.00530383 | 1.2e-05 |
-| cl | 0.11996099 | 0.11996090 | 7.1e-07 |
-| v | 8.01790190 | 8.01790057 | 1.7e-07 |
-| omega_ka | 0.39776485 | 0.39781141 | 1.2e-04 |
-| omega_cl | 0.40613069 | 0.40612379 | 1.7e-05 |
-| omega_v | 0.23978401 | 0.23978801 | 1.7e-05 |
-| sigma | 0.48382927 | 0.48382740 | 3.9e-06 |
+| ka | 0.56807586 | 0.56807048 | 9.5e-06 |
+| cl | 0.12815147 | 0.12815181 | 2.7e-06 |
+| v | 7.80891370 | 7.80893398 | 2.6e-06 |
+| omega_ka | 0.47459225 | 0.47450662 | 1.8e-04 |
+| omega_cl | 0.23367092 | 0.23366642 | 1.9e-05 |
+| omega_v | 0.22569858 | 0.22568894 | 4.3e-05 |
+| sigma | 1.04296306 | 1.04296538 | 2.2e-06 |
 
-Wall is the federated loop only (the rounds), excluding the one-off model compilation in
-each site process and the pooled reference fit. The additivity of the site quantities is
-exact: at the true theta the three site log-likelihoods sum to the pooled value with
-relative difference 1.7e-16, and the summed gradients match the pooled gradient to 1.1e-14.
+Wall is the federated loop only (the rounds), excluding the prepare round and the pooled
+reference fit. Warm rounds cost 0.10 to 0.22 s; in the simulation runtime a few rounds
+still cost about 60 s, see the caveat under *How it works*.
 
 The residual parameter differences are optimizer tolerance, not federation error: the site
-contributions themselves agree with the pooled quantity to floating-point precision.
+contributions themselves are exact. At the true theta of the simulated data the three site
+log-likelihoods sum to the pooled value with relative difference 1.7e-16 and the summed
+gradients match the pooled gradient to 1.1e-14.
+
+On the real data L-BFGS-B ends with an abnormal line-search termination at |grad| ~1e-2
+rather than a clean convergence flag - real-data curvature, not a federation problem. It
+stops at the pooled optimum all the same, which is what the acceptance measures; the
+converged flag is reported but nothing is gated on it.
 
 ## Quickstart
 
@@ -159,15 +186,17 @@ python3 -m venv .venv
 .venv/bin/pip install -e . "git+https://github.com/manuhuth/NoLimitsPy"
 ```
 
-NoLimits' federation primitives (`objective_and_gradient`) are on NoLimits main and not yet
-in a registered release, so the repo uses one shared pre-release Julia project
-(`julia_env/`, gitignored):
+NoLimits' federation primitives (`objective_and_gradient`, `build_fit_context`) are on
+NoLimits main and not yet in a registered release, so the repo uses one shared pre-release
+Julia project (`julia_env/`, gitignored). `CSV` is there for the warfarin loader, which
+needs it as a weak dependency:
 
 ```bash
-julia +1.11 -e 'import Pkg; Pkg.activate("julia_env"); Pkg.add(url="https://github.com/manuhuth/NoLimits.jl", rev="main"); Pkg.add("PythonCall")'
+julia +1.11 -e 'import Pkg; Pkg.activate("julia_env"); Pkg.add(url="https://github.com/manuhuth/NoLimits.jl", rev="main"); Pkg.add(["PythonCall", "CSV"])'
 ```
 
-Refresh it with `Pkg.update()` when new Julia fixes land on main. Run Python entry points
+Refresh it with `Pkg.update()` when new Julia fixes land on main, using the same Julia the
+env was built with (`julia +1.11`; mixing minor versions invalidates the precompile cache). Run Python entry points
 outside Flower with:
 
 ```bash
@@ -183,12 +212,15 @@ so cap the simulation concurrency:
 
 ```bash
 flwr run . --stream --federation-config \
-  "num-supernodes=3 client-resources-num-cpus=1 init-args-num-cpus=2"
+  "num-supernodes=3 client-resources-num-cpus=1 init-args-num-cpus=3"
 ```
 
-`init-args-num-cpus=2` with one CPU per ClientApp gives 3 sites with 2 running at a time.
-The run logs every round, the federated theta*, the per-site contributions, the acceptance
-table above and a final `PASS:` line.
+One CPU per ClientApp and as many CPUs as sites gives each site its own Ray actor; drop to
+`init-args-num-cpus=2` to run only two sites at a time on a small machine, at the price of
+a few extra DataModel builds mid-fit (see the caveat above). The run logs the prepare
+table, every round, the federated theta*, the per-site contributions, the acceptance
+table above and a final `PASS:` line. It federates the real warfarin data by default; the
+first run downloads it and writes the `data/warfarin.csv` cache.
 
 Run-config knobs (`--run-config 'key=value ...'`):
 
@@ -196,7 +228,8 @@ Run-config knobs (`--run-config 'key=value ...'`):
 |---|---|---|
 | `estimator` | `"laplace"` | `laplace`, or `ghq` for Gauss-Hermite quadrature |
 | `ghq-level` | 5 | quadrature level when `estimator="ghq"` |
-| `data-seed` | 20260818 | which simulated data set to federate |
+| `data-source` | `"warfarin"` | the real warfarin PK data, or `"simulated"` for the seeded synthetic set |
+| `data-seed` | 20260818 | which simulated data set; ignored when `data-source="warfarin"` |
 | `max-rounds` | 100 | cap on federated rounds (L-BFGS-B `maxfun`) |
 | `fail-site` | -1 | TESTING ONLY: that site id raises in its handler |
 
@@ -229,7 +262,8 @@ before changing it:
   (the process hangs; NoLimitsPy raises instead). The ClientApp module is imported on the
   main thread of its ClientAppActor process, so `client_app.py` boots Julia at module level.
   Every client process must keep doing that, whatever thread handlers later run on. The site
-  DataModel is cached in a module global keyed by (partition, seed): `context.state` holds
+  DataModel (and its FitContext, on the Julia side) is cached in a module global keyed by
+  (partition, number of partitions, data source, seed): `context.state` holds
   records only, and ClientApp objects are rebuilt per message, so a module global is the only
   place a live Julia object survives across rounds.
 - **Server worker-thread constraint.** The ServerApp runs on a worker thread
@@ -244,6 +278,10 @@ ServerApp and ClientApp processes, so `nolimits_flower/__init__.py` re-pins `jul
 relative to the package before anything boots Julia. Without that, clients silently fall
 back to the venv's own Julia project, which has the registered NoLimits and no
 `objective_and_gradient`.
+
+A local `flwr run` starts a `flower-superlink`/`flower-superexec` pair that **outlives the
+run**. They are harmless but they hold the control API port, so kill them (`pkill -f
+flower-superlink`) before switching branches or debugging a run that seems to hang.
 
 ## Failure handling
 

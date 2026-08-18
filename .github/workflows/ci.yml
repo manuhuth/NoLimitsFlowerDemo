@@ -38,7 +38,7 @@ jobs:
         run: |
           julia -e 'import Pkg; Pkg.activate("julia_env");
                     Pkg.add(url="https://github.com/manuhuth/NoLimits.jl", rev="main");
-                    Pkg.add("PythonCall"); Pkg.precompile()'
+                    Pkg.add(["PythonCall", "CSV"]); Pkg.precompile()'
 
       # Editable install: nolimits_flower/__init__.py pins julia_env/ relative to the
       # package, which only resolves to the repo checkout when installed in place.
@@ -54,6 +54,14 @@ jobs:
         run: |
           flwr --version
           python -c "import NoLimitsPy as nl; nl.seval('1'); print(nl.status())"
+
+      # The warfarin loader downloads once and caches to data/warfarin.csv; priming it
+      # here keeps both test lanes offline (and the equivalence test skips without it).
+      - name: Prime the warfarin data cache
+        env:
+          PYTHON_JULIAPKG_PROJECT: ${{ github.workspace }}/julia_env
+          PYTHON_JULIAPKG_OFFLINE: "yes"
+        run: python -c "from nolimits_flower import task; print(task.warfarin().shape)"
 
       - name: Fast tests
         run: pytest tests -m "not slow" -q
