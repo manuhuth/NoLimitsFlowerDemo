@@ -5,7 +5,17 @@ Federated nonlinear mixed-effects estimation with [Flower](https://flower.ai) an
 site; sites exchange only the marginal log-likelihood (and later its gradient) at a
 common parameter vector.
 
-Status: scaffold. The Flower round trip runs; NoLimits is not wired in yet.
+Status: Phase 2. `flwr run .` runs one verification round: the server broadcasts the true
+simulation theta (transformed scale), each of 3 sites answers with
+`objective_and_gradient(Laplace(), dm_site, theta)`, and the summed value and gradient are
+compared against the same call on the pooled data set. Observed on the seeded demo data:
+
+```
+sites=3 summed value=-126.0322291370 pooled value=-126.0322291370 rel=4.510e-16
+gradient rel-diffs=[1.50e-16 0 0 0] (worst 1.503e-16)
+```
+
+The federated optimizer loop is Phase 3.
 
 ## Development setup
 
@@ -31,6 +41,23 @@ export PYTHON_JULIAPKG_OFFLINE=yes
 ```
 
 Drop both once the primitives ship in a registered NoLimits release.
+
+Flower's per-run runtime environment does not pass `PYTHON_JULIAPKG_*` on to the
+ServerApp/ClientApp processes, so `nolimits_flower/__init__.py` re-pins `julia_env/`
+(resolved relative to the package) before anything boots Julia. Without that, clients fall
+back to the venv's own Julia project, which has the registered NoLimits and no
+`objective_and_gradient`.
+
+Julia boot rules observed in the flwr 1.33 simulation runtime:
+
+- The ClientApp module is imported on the **main thread** of its ClientAppActor process and
+  the query handler also runs on that main thread, so the module-level warm-up in
+  `client_app.py` is enough; no fallback was needed.
+- The ServerApp is imported and run on a worker thread
+  (`Thread-9 (server_th_with_start_checks)`), so it can never boot Julia itself. Its pooled
+  reference runs as a child process (`python -m nolimits_flower.task`) whose output is
+  captured - letting the child write Julia's chatter into the inherited log pipe deadlocked
+  it.
 
 ## Run the demo
 

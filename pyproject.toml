@@ -25,4 +25,5 @@ serverapp = "nolimits_flower.server_app:app"
 clientapp = "nolimits_flower.client_app:app"
 
 [tool.flwr.app.config]
-num-server-rounds = 3
+estimator = "laplace"
+ghq-level = 5
