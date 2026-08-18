@@ -102,18 +102,25 @@ of optimization round 1 and makes it visible in the log:
 ```
 PREPARE ROUND (3 sites)
   site   subjects      setup (s)
-  0            10           81.3
-  1            10           81.1
-  2            10           81.7
+  0            10           77.3
+  1            10           61.8
+  2            10           62.1
 ```
 
-Caveat specific to the *simulation* runtime: Ray's ClientAppActors are not pinned to a
-node, so an actor can be handed a partition it has not built yet and pays the build then.
-Measured on the warfarin run with one CPU per site (`init-args-num-cpus=3`): after a 108 s
+Caveat specific to the *simulation* runtime: Ray's ClientAppActors are pulled from an idle
+pool and are **not** pinned to a partition, so with several actors an actor can be handed a
+site it has not built yet and pays that site's build mid-fit. Measured on the warfarin run
+with one actor per site (`client-resources-num-cpus=1 init-args-num-cpus=3`): after a 108 s
 prepare round the warm rounds cost 0.10 to 0.22 s, but rounds 1, 3 and 4 still cost about
-63 s each. More actors reduce that, they do not eliminate it. In deployment the question
-does not arise: one SuperNode per site, one process, one DataModel, one FitContext, and the
-prepare round absorbs the whole setup cost.
+63 s each. flwr 1.33 has no pinning knob (the pool holds
+`floor(available_cpus / client-resources-num-cpus)` interchangeable actors), so the demo
+sizes the pool to **one** actor - `client-resources-num-cpus` equal to
+`init-args-num-cpus` - which pins by construction: that actor prepares all three sites and
+then serves every round warm. Cost of the choice: the three site setups run sequentially, so
+the prepare round is 226 s instead of 108 s, and each round evaluates the sites one after
+another (0.10 s in total here, since a warm site call is 2.6 ms). End to end that is still
+230 s against 372 s. In deployment the question does not arise: one SuperNode per site, one
+process, one DataModel, one FitContext, and the prepare round absorbs the whole setup cost.
 
 The server asserts that every site reports ready and that all sites report *identical*
 names and theta0 (they run the same model, so a mismatch means they do not, and the summed
@@ -130,6 +137,14 @@ needs no Julia at all for the optimization.
    cache: on one warfarin site that is 2.6 ms per call against 17.6 ms for the equivalent
    `DataModel` call, which rebuilds them every time. Both forms return the same numbers.
 3. The server sums the values and the gradients and hands them to L-BFGS-B (`jac=True`).
+
+The server optimizes a **preconditioned** coordinate z with theta = theta0 + s * z (so the
+gradient it reports is `s * grad_theta`). The scale s follows NoLimits' own rule, mirrored
+in `task.precondition_scale` from `_precondition_scale` / `_precondition_maps` in
+NoLimits.jl `src/estimation/common.jl`: `s_i = max(|theta0_i|, 1)` for a coordinate on the
+identity scale, 1 for a log-scaled one. Here only `v` (about 8 L) differs from 1, and that
+one number is worth 85 rounds down to 29 - the raw scale also made L-BFGS-B exit with the
+cosmetic `ABNORMAL` flag, the preconditioned one converges cleanly.
 
 Theta crosses the wire on the transformed (unconstrained) scale, so positivity constraints
 stay implicit and the server needs no bounds. `max-rounds` caps the number of federated
@@ -148,34 +163,43 @@ objective within 1e-6 relative, every natural-scale parameter within 1e-3 relati
 
 | data-source | sites | subjects | rounds | wall | federated loglik | pooled loglik | loglik rel.diff | worst parameter rel.diff |
 |---|---|---|---|---|---|---|---|---|
-| `warfarin` (real) | 3 | 10/10/10 | 85 | 263.9 s | -403.2872861703 | -403.2872858633 | 7.6e-10 | 1.8e-04 (omega_ka) |
-| `simulated` | 3 | 8/8/8 | 45 | 199.5 s | -324.1753630917 | -324.1753625815 | 1.6e-09 | 2.2e-04 (sigma) |
+| `warfarin` (real) | 3 | 10/10/10 | 29 | 3.5 s | -403.2872869375 | -403.2872858633 | 2.7e-09 | 1.8e-04 (omega_v) |
+| `simulated` | 3 | 8/8/8 | 33 | 3.3 s | -324.1753626167 | -324.1753625815 | 1.1e-10 | 1.4e-05 (omega_cl) |
+
+Before preconditioning and actor pinning the same two runs took 85 rounds / 263.9 s and 45
+rounds / 199.5 s, with individual rounds up to 63 s:
+
+| run | rounds | loop wall | slowest round | L-BFGS-B exit |
+|---|---|---|---|---|
+| warfarin, before | 85 | 263.9 s | ~63 s | ABNORMAL_TERMINATION_IN_LNSRCH |
+| warfarin, after | 29 | 3.5 s | 0.22 s | CONVERGENCE |
+| simulated, before | 45 | 199.5 s | ~63 s | ABNORMAL_TERMINATION_IN_LNSRCH |
+| simulated, after | 33 | 3.3 s | 0.11 s | CONVERGENCE |
 
 Per-parameter on the real warfarin data:
 
 | parameter | federated | pooled | rel.diff |
 |---|---|---|---|
-| ka | 0.56807586 | 0.56807048 | 9.5e-06 |
-| cl | 0.12815147 | 0.12815181 | 2.7e-06 |
-| v | 7.80891370 | 7.80893398 | 2.6e-06 |
-| omega_ka | 0.47459225 | 0.47450662 | 1.8e-04 |
-| omega_cl | 0.23367092 | 0.23366642 | 1.9e-05 |
-| omega_v | 0.22569858 | 0.22568894 | 4.3e-05 |
-| sigma | 1.04296306 | 1.04296538 | 2.2e-06 |
+| ka | 0.56804852 | 0.56807048 | 3.9e-05 |
+| cl | 0.12815179 | 0.12815181 | 1.7e-07 |
+| v | 7.80891424 | 7.80893398 | 2.5e-06 |
+| omega_ka | 0.47452538 | 0.47450662 | 4.0e-05 |
+| omega_cl | 0.23369895 | 0.23366642 | 1.4e-04 |
+| omega_v | 0.22572954 | 0.22568894 | 1.8e-04 |
+| sigma | 1.04295630 | 1.04296538 | 8.7e-06 |
 
-Wall is the federated loop only (the rounds), excluding the prepare round and the pooled
-reference fit. Warm rounds cost 0.10 to 0.22 s; in the simulation runtime a few rounds
-still cost about 60 s, see the caveat under *How it works*.
+Wall is the federated loop only (the rounds), excluding the 226 s prepare round and the
+pooled reference fit. Every round is warm (0.10 to 0.22 s): with a single-actor pool no
+round after prepare re-pays a DataModel build, see the caveat under *How it works*.
 
 The residual parameter differences are optimizer tolerance, not federation error: the site
 contributions themselves are exact. At the true theta of the simulated data the three site
 log-likelihoods sum to the pooled value with relative difference 1.7e-16 and the summed
 gradients match the pooled gradient to 1.1e-14.
 
-On the real data L-BFGS-B ends with an abnormal line-search termination at |grad| ~1e-2
-rather than a clean convergence flag - real-data curvature, not a federation problem. It
-stops at the pooled optimum all the same, which is what the acceptance measures; the
-converged flag is reported but nothing is gated on it.
+Both runs now end with `CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH`; on the raw
+transformed scale the same fits ended with the cosmetic `ABNORMAL_TERMINATION_IN_LNSRCH`
+flag. The flag is reported but nothing is gated on it - the acceptance table is.
 
 ## Quickstart
 
@@ -212,12 +236,14 @@ so cap the simulation concurrency:
 
 ```bash
 flwr run . --stream --federation-config \
-  "num-supernodes=3 client-resources-num-cpus=1 init-args-num-cpus=3"
+  "num-supernodes=3 client-resources-num-cpus=3 init-args-num-cpus=3"
 ```
 
-One CPU per ClientApp and as many CPUs as sites gives each site its own Ray actor; drop to
-`init-args-num-cpus=2` to run only two sites at a time on a small machine, at the price of
-a few extra DataModel builds mid-fit (see the caveat above). The run logs the prepare
+Equal `client-resources-num-cpus` and `init-args-num-cpus` size the Ray actor pool to one
+actor, which serves all three sites: one Julia, one model compilation, and no site build
+after the prepare round (see the caveat above). Setting `client-resources-num-cpus=1`
+instead gives one actor per site and a faster prepare round, at the price of ~60 s
+re-warm rounds mid-fit. The run logs the prepare
 table, every round, the federated theta*, the per-site contributions, the acceptance
 table above and a final `PASS:` line. It federates the real warfarin data by default; the
 first run downloads it and writes the `data/warfarin.csv` cache.
@@ -311,9 +337,9 @@ pytest tests -m slow -q -s        # federated fit plus the fault-injection abort
 ```
 
 The fast tests need neither Julia nor a federation and run in seconds. The slow tests submit
-real `flwr run` invocations and poll `flwr log`: 793 s together on a laptop, dominated by the
-equivalence run (a 45 round federated fit plus the pooled reference fit, with one model
-compilation per site process). `.github/workflows/ci.yml` runs the fast tests on every push
+real `flwr run` invocations and poll `flwr log`: 611 s together on a laptop, dominated by
+the two prepare rounds (one model compilation per run, plus one DataModel build per site)
+and the pooled reference fit; the federated loop itself is 3.3 s. `.github/workflows/ci.yml` runs the fast tests on every push
 and the slow suite with a 45 minute ceiling.
 
 ## Deployment outlook

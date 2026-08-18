@@ -26,9 +26,10 @@ import pytest
 from nolimits_flower import task
 
 REPO = Path(__file__).resolve().parents[1]
-# One CPU per ClientApp and as many CPUs as sites: each site gets its own Ray actor, so
-# the prepare round pays the DataModel build once per site instead of again mid-fit.
-FEDERATION = "num-supernodes=3 client-resources-num-cpus=1 init-args-num-cpus=3"
+# Equal client and init CPUs size the Ray actor pool to ONE actor
+# (floor(init/client)), the only way flwr 1.33 pins partitions to a process: that actor
+# builds all three sites in the prepare round, so no later round re-pays a build.
+FEDERATION = "num-supernodes=3 client-resources-num-cpus=3 init-args-num-cpus=3"
 
 
 FLWR = str(Path(sys.executable).parent / "flwr")
@@ -76,6 +77,11 @@ def test_federated_fit_matches_the_pooled_fit():
     table = [l for l in log.splitlines() if "ACCEPTANCE" in l or re.search(r"\d\.\d{8}", l)]
     print("\n".join(table))
     assert "PASS:" in log, log[-4000:]
+    # Actor pinning: with a one-actor pool every round after prepare is warm (~0.1 s).
+    # A round in the tens of seconds means the pool grew and re-paid a DataModel build.
+    slowest = float(re.search(r"slowest round ([\d.]+)s", log).group(1))
+    print(f"slowest post-prepare round: {slowest:.2f}s")
+    assert slowest < 5.0, f"slowest round {slowest}s: actors are not pinned"
 
 
 @pytest.mark.slow

@@ -73,6 +73,24 @@ def test_log_scaled_matches_the_model_string():
     assert declared | plain == set(task.PARAM_NAMES)
 
 
+def test_precondition_scale_matches_the_nolimits_rule():
+    """max(|theta0_t|, 1) on identity-scale coordinates, 1 on the log-scale ones."""
+    names = list(task.PARAM_NAMES)
+    natural = np.array([task.TRUE_THETA[n] for n in names])
+    x0 = np.where([n in task.LOG_SCALED for n in names], np.log(natural), natural)
+    s = task.precondition_scale(x0, names)
+    assert dict(zip(names, s)) == {
+        "ka": 1.0, "cl": 1.0, "v": 8.0,  # max(|1.0|,1), max(|0.13|,1), max(|8.0|,1)
+        "omega_ka": 1.0, "omega_cl": 1.0, "omega_v": 1.0, "sigma": 1.0,
+    }
+    # The reparameterization is exact at the start point and invertible.
+    assert np.allclose(x0 + s * np.zeros_like(x0), x0)
+    assert np.allclose(x0 + s * ((x0 * 1.5 - x0) / s), x0 * 1.5)
+    # NoLimits also log-scales anything the model uses inside `exp`; MODEL has none, so
+    # LOG_SCALED is the whole rule.
+    assert "exp(" not in task.MODEL
+
+
 warfarin_cached = pytest.mark.skipif(
     not task.WARFARIN_CACHE.exists(),
     reason="needs data/warfarin.csv; one online run or `python -m nolimits_flower.task fit` "

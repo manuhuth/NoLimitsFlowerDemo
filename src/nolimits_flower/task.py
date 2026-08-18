@@ -257,6 +257,20 @@ def to_natural(theta_transformed, names) -> np.ndarray:
     return np.where([n in LOG_SCALED for n in names], np.exp(theta), theta)
 
 
+def precondition_scale(theta0_transformed, names) -> np.ndarray:
+    """Diagonal preconditioning scale for the server optimizer, NoLimits' own rule.
+
+    Mirrors `_precondition_scale` / `_precondition_maps` in NoLimits.jl
+    src/estimation/common.jl (nlmixr2's scaleC): the optimizer works in z with
+    theta_t = theta0_t + s .* z, and s_i = max(|theta0_t_i|, 1) for a coordinate that is
+    on the identity scale, else 1. NoLimits also treats a parameter that the model uses
+    inside an `exp` as log-scaled; MODEL here has no `exp`, so LOG_SCALED is the whole
+    rule. Reimplemented rather than called: this runs on the server, which has no Julia.
+    """
+    theta0 = np.asarray(theta0_transformed, dtype=float)
+    return np.where([n in LOG_SCALED for n in names], 1.0, np.maximum(np.abs(theta0), 1.0))
+
+
 def pooled_reference(estimator: str = "laplace", ghq_level: int = 5, seed: int = DEFAULT_SEED,
                      source: str = DEFAULT_SOURCE):
     """(theta_transformed, value, gradient) at the additivity-check theta, unpartitioned.

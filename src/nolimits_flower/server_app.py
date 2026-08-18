@@ -217,39 +217,51 @@ def _fit(grid: Grid, context: Context) -> None:
         estimator, source, seed, names, task.to_natural(x0, names))
 
     rounds = 0
+    max_round_wall = 0.0
     t0 = time.perf_counter()
 
-    def federated(x: np.ndarray):
-        nonlocal rounds
+    # Preconditioning, NoLimits' own rule (see task.precondition_scale): optimize z with
+    # theta = x0 + s * z, so grad_z = s * grad_theta. Raw transformed coordinates mix a
+    # volume of ~8 with unit-size log-parameters, which costs L-BFGS-B extra evaluations.
+    s = task.precondition_scale(x0, names)
+    log(INFO, "preconditioning scale = %s", dict(zip(names, s.tolist())))
+
+    def federated(z: np.ndarray):
+        nonlocal rounds, max_round_wall
         rounds += 1
         t_round = time.perf_counter()
-        sites = broadcast(grid, np.asarray(x, dtype=float), config, rnd=rounds)
+        x = x0 + s * np.asarray(z, dtype=float)
+        sites = broadcast(grid, x, config, rnd=rounds)
         value = sum(v for _, v, _ in sites)
         grad = np.sum([g for _, _, g in sites], axis=0)
+        round_wall = time.perf_counter() - t_round
+        max_round_wall = max(max_round_wall, round_wall)
         log(INFO, "round %d: loglik=%.10f |grad|=%.3e sites=%d wall=%.2fs", rounds, value,
-            np.linalg.norm(grad), len(sites), time.perf_counter() - t_round)
-        return -value, -grad  # L-BFGS-B minimizes; the sites report a log-likelihood
+            np.linalg.norm(grad), len(sites), round_wall)
+        return -value, -(s * grad)  # L-BFGS-B minimizes; the sites report a log-likelihood
 
     # maxfun caps function evaluations, i.e. federated rounds - the round guard. maxiter
     # alone would not: line searches spend extra evaluations per iteration. A truncated
     # run leaves res.success False and fails the acceptance below, rather than passing
     # off a half-optimized theta as the optimum.
     res = minimize(
-        federated, x0, method="L-BFGS-B", jac=True,
+        federated, np.zeros_like(x0), method="L-BFGS-B", jac=True,
         options={"maxiter": max_rounds, "maxfun": max_rounds},
     )
     wall = time.perf_counter() - t0
+    theta_star = x0 + s * res.x
 
     # Final round at the optimum: also gives the per-site contributions to report.
-    final = broadcast(grid, res.x, config, rnd=rounds + 1)
+    final = broadcast(grid, theta_star, config, rnd=rounds + 1)
     rounds += 1
     fed_value = sum(v for _, v, _ in final)
-    fed_natural = task.to_natural(res.x, names)
+    fed_natural = task.to_natural(theta_star, names)
 
     log(INFO, "converged=%s (%s)", res.success, res.message)
     log(INFO, "federated theta*(natural) = %s", dict(zip(names, fed_natural.tolist())))
-    log(INFO, "federated loglik=%.10f evaluation rounds=%d wall=%.1fs (%.2fs/round)",
-        fed_value, rounds, wall, wall / max(rounds, 1))
+    log(INFO, "federated loglik=%.10f evaluation rounds=%d wall=%.1fs (%.2fs/round, "
+        "slowest round %.2fs)", fed_value, rounds, wall, wall / max(rounds, 1),
+        max_round_wall)
     for site_id, value, _ in sorted(final):
         log(INFO, "  site %d contribution: %.10f", site_id, value)
 
