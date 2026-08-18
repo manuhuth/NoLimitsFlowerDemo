@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "nolimits-flower"
 version = "0.1.0"
 description = "Federated nonlinear mixed-effects estimation with Flower and NoLimitsPy"
+license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = [
     "flwr[simulation]>=1.33.0",
@@ -19,6 +20,14 @@ where = ["src"]
 
 [tool.flwr.app]
 publisher = "manuhuth"
+fab-format-version = 1
+flwr-version-target = "1.33.0"
+# FAB hygiene: the bundle is shipped to every SuperNode, so julia_env/ (gigabytes) and
+# .venv/ must never enter it. Both are kept out by .gitignore, which `flwr build`
+# honours, on top of flwr's built-in excludes (.venv, __pycache__, test_*.py). No
+# fab-exclude: with flwr 1.33 any user pattern turns the collected .gitignore into a
+# hard "conflicts with built-in constraints" build error. Re-inspect after upgrades:
+#   flwr build && python -c "import zipfile,glob;print(sorted(zipfile.ZipFile(sorted(glob.glob('*.fab'))[-1]).namelist()))"
 
 [tool.flwr.app.components]
 serverapp = "nolimits_flower.server_app:app"
@@ -29,3 +38,7 @@ estimator = "laplace"
 ghq-level = 5
 data-seed = 20260818
 max-rounds = 100
+fail-site = -1  # testing only: make this site id raise in its handler
+
+[tool.pytest.ini_options]
+markers = ["slow: boots one Julia per simulated site and fits (minutes)"]

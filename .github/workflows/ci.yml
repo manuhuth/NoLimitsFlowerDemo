@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # Julia 1.11 is what juliapkg selects for NoLimitsPy, so the pre-release
+      # julia_env must be built with the same minor version.
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: "1.11"
+      - uses: julia-actions/cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # PRE-RELEASE: the federation primitives (objective_and_gradient) are on NoLimits
+      # main, not in the registered 0.2.5. Build one shared Julia project from main.
+      # Once NoLimits v0.2.6 is registered, replace this step with a plain
+      # Pkg.add("NoLimits") (or drop it entirely and let juliapkg resolve NoLimits),
+      # and drop the PYTHON_JULIAPKG_* pinning below.
+      - name: Build the pre-release julia_env
+        run: |
+          julia -e 'import Pkg; Pkg.activate("julia_env");
+                    Pkg.add(url="https://github.com/manuhuth/NoLimits.jl", rev="main");
+                    Pkg.add("PythonCall"); Pkg.precompile()'
+
+      # Editable install: nolimits_flower/__init__.py pins julia_env/ relative to the
+      # package, which only resolves to the repo checkout when installed in place.
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . "git+https://github.com/manuhuth/NoLimitsPy" pytest
+
+      - name: Versions
+        env:
+          PYTHON_JULIAPKG_PROJECT: ${{ github.workspace }}/julia_env
+          PYTHON_JULIAPKG_OFFLINE: "yes"
+        run: |
+          flwr --version
+          python -c "import NoLimitsPy as nl; nl.seval('1'); print(nl.status())"
+
+      - name: Fast tests
+        run: pytest tests -m "not slow" -q
+
+      # One Julia per simulated site plus the pooled reference fit: minutes, not seconds.
+      - name: Slow equivalence test
+        timeout-minutes: 45
+        env:
+          PYTHON_JULIAPKG_PROJECT: ${{ github.workspace }}/julia_env
+          PYTHON_JULIAPKG_OFFLINE: "yes"
+        run: pytest tests -m slow -q -s
