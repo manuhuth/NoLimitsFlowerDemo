@@ -1,8 +1,10 @@
 """Model, synthetic data, site partitioning and theta glue. No Flower imports.
 
-Theta on the wire is the TRANSFORMED (optimization) scale: all four fixed effects
-are `scale=:log`, so the wire vector is unconstrained and the server optimizer in
-Phase 3 keeps positivity implicitly.
+Theta on the wire is the TRANSFORMED (optimization) scale, which keeps the variance
+parameters positive without server-side bounds. The model mixes scales (the structural
+PK parameters are plain, the omegas and sigma are `scale=:log`), so `LOG_SCALED` is the
+map the server uses to report natural-scale numbers without booting Julia; `pooled_fit`
+checks it against Julia's own inverse transform on every run.
 
 `objective_and_gradient(method, dm, theta; scale=...)` always wants theta on the
 NATURAL scale and only uses `scale` to pick the coordinates of the returned
@@ -18,35 +20,66 @@ helper defined once per process (`JULIA_HELPERS`).
 import numpy as np
 import pandas as pd
 
-# The tiny quickstart model: exponential decay, one Normal RE on ID.
+# Warfarin population PK: one-compartment oral absorption (depot -> central) with
+# multiplicative log-normal random effects on ka, cl and v. The ODE is linear, so
+# NoLimits takes its closed-form fast path instead of a numerical solver.
 MODEL = """
 @fixedEffects begin
-    A0    = RealNumber(10.0, scale=:log)
-    k     = RealNumber(0.3, scale=:log)
-    omega = RealNumber(0.3, scale=:log)
-    sigma = RealNumber(0.5, scale=:log)
+    ka       = RealNumber(1.0)
+    cl       = RealNumber(0.13)
+    v        = RealNumber(8.0)
+    omega_ka = RealNumber(0.4, scale=:log)
+    omega_cl = RealNumber(0.3, scale=:log)
+    omega_v  = RealNumber(0.2, scale=:log)
+    sigma    = RealNumber(0.5, scale=:log)
 end
 
 @covariates begin
-    time = Covariate()
+    t    = Covariate()
+    Dose = ConstantCovariate(constant_on=:ID)
 end
 
 @randomEffects begin
-    eta = RandomEffect(Normal(0.0, omega); column=:ID)
+    eta_ka = RandomEffect(LogNormal(0.0, omega_ka); column=:ID)
+    eta_cl = RandomEffect(LogNormal(0.0, omega_cl); column=:ID)
+    eta_v  = RandomEffect(LogNormal(0.0, omega_v);  column=:ID)
+end
+
+@preDifferentialEquation begin
+    kai = ka * eta_ka
+    cli = cl * eta_cl
+    vi  = v * eta_v
+end
+
+@DifferentialEquation begin
+    D(depot)   ~ -kai * depot
+    D(central) ~ kai * depot - (cli / vi) * central
+end
+
+@initialDE begin
+    depot   = Dose
+    central = 0.0
 end
 
 @formulas begin
-    pred = A0 * exp(eta) * exp(-k * time)
-    y ~ Normal(pred, sigma)
+    cp = central(t) / vi
+    conc ~ Normal(cp, sigma)
 end
 """
 
-# Truth used by the simulation; also the theta the Phase-2 verification round uses.
-TRUE_THETA = {"A0": 10.0, "k": 0.3, "omega": 0.3, "sigma": 0.5}
+# Truth used by the simulation; also the model's own initial values (see MODEL) and the
+# theta the additivity check uses. Warfarin-typical: 100 mg oral dose, conc in mg/L.
+TRUE_THETA = {
+    "ka": 1.0, "cl": 0.13, "v": 8.0,
+    "omega_ka": 0.4, "omega_cl": 0.3, "omega_v": 0.2, "sigma": 0.5,
+}
 PARAM_NAMES = tuple(TRUE_THETA)
+# The fixed effects declared `scale=:log` in MODEL; everything else is plain.
+LOG_SCALED = frozenset({"omega_ka", "omega_cl", "omega_v", "sigma"})
 
 N_SUBJECTS = 24
-TIMES = (0.5, 1.0, 2.0, 4.0)
+DOSE = 100.0
+TIMES = (0.5, 1.0, 2.0, 4.0, 8.0, 24.0, 36.0, 48.0, 72.0, 96.0, 120.0)
 DEFAULT_SEED = 20260818
 
 # Defined once per Julia session; `nlf_objgrad` is the only thing the client calls.
@@ -78,6 +111,16 @@ function nlf_natural(dm, v)
     inv(NoLimits.ComponentArrays.ComponentArray(collect(Float64, v), ax))
 end
 
+nlf_natural_vec(dm, v) = Vector{Float64}(nlf_natural(dm, v))
+
+# Natural-scale vector -> transformed-scale wire vector (the model's own transform, so
+# mixed scales need no bookkeeping on the Python side).
+function nlf_transform(dm, v)
+    ax = NoLimits.ComponentArrays.getaxes(NoLimits.get_params(dm, scale = :untransformed))
+    ca = NoLimits.ComponentArrays.ComponentArray(collect(Float64, v), ax)
+    Vector{Float64}(dm.model.fixed.transform(ca))
+end
+
 # (value, gradient-on-transformed-axes) at the transformed-scale wire vector.
 function nlf_objgrad(dm, v, method)
     val, grad = NoLimits.objective_and_gradient(method, dm, nlf_natural(dm, v), scale = "transformed")
@@ -87,15 +130,27 @@ end
 
 
 def simulate(seed: int = DEFAULT_SEED, n_subjects: int = N_SUBJECTS) -> pd.DataFrame:
-    """Seeded synthetic data at TRUE_THETA: n_subjects x len(TIMES) observations."""
+    """Seeded synthetic data at TRUE_THETA: n_subjects x len(TIMES) concentrations.
+
+    The concentration is the closed-form solution of the model's own linear ODE
+    (single bolus into depot at t=0), so the simulation needs no solver.
+    """
     rng = np.random.default_rng(seed)
     p = TRUE_THETA
-    eta = rng.normal(0.0, p["omega"], size=n_subjects)
+    kai = p["ka"] * rng.lognormal(0.0, p["omega_ka"], size=n_subjects)
+    cli = p["cl"] * rng.lognormal(0.0, p["omega_cl"], size=n_subjects)
+    vi = p["v"] * rng.lognormal(0.0, p["omega_v"], size=n_subjects)
+    ke = cli / vi
     ids = np.repeat(np.arange(n_subjects), len(TIMES))
-    time = np.tile(np.asarray(TIMES, dtype=float), n_subjects)
-    pred = p["A0"] * np.exp(eta)[ids] * np.exp(-p["k"] * time)
-    y = pred + rng.normal(0.0, p["sigma"], size=pred.size)
-    return pd.DataFrame({"ID": [f"S{i:02d}" for i in ids], "time": time, "y": y})
+    t = np.tile(np.asarray(TIMES, dtype=float), n_subjects)
+    cp = (
+        DOSE / vi[ids] * kai[ids] / (kai[ids] - ke[ids])
+        * (np.exp(-ke[ids] * t) - np.exp(-kai[ids] * t))
+    )
+    conc = cp + rng.normal(0.0, p["sigma"], size=cp.size)
+    return pd.DataFrame({
+        "ID": [f"S{i:02d}" for i in ids], "t": t, "Dose": DOSE, "conc": conc,
+    })
 
 
 def partition(df: pd.DataFrame, num_sites: int) -> list[pd.DataFrame]:
@@ -116,7 +171,7 @@ def build_data_model(nl, df: pd.DataFrame):
     if not _helpers_loaded:
         nl.seval(JULIA_HELPERS)
         _helpers_loaded = True
-    return nl.DataModel(nl.model(MODEL), df, primary_id="ID", time_col="time")
+    return nl.DataModel(nl.model(MODEL), df, primary_id="ID", time_col="t")
 
 
 def true_theta_transformed(nl, dm) -> np.ndarray:
@@ -124,12 +179,19 @@ def true_theta_transformed(nl, dm) -> np.ndarray:
     names = [str(s) for s in nl.seval("nlf_names")(dm)]
     if set(names) != set(TRUE_THETA):
         raise ValueError(f"model parameters {names} do not match TRUE_THETA")
-    return np.log([TRUE_THETA[n] for n in names])  # every fixed effect is scale=:log
+    natural = np.array([TRUE_THETA[n] for n in names], dtype=float)
+    return np.asarray(nl.seval("nlf_transform")(dm, natural), dtype=float)
 
 
-def to_natural(theta_transformed) -> np.ndarray:
-    """Transformed -> natural scale. Every fixed effect is scale=:log, so this is exp."""
-    return np.exp(np.asarray(theta_transformed, dtype=float))
+def to_natural(theta_transformed, names) -> np.ndarray:
+    """Transformed -> natural scale: exp for the `scale=:log` parameters, else identity.
+
+    The Julia-free twin of the model's inverse transform, so the ServerApp (a worker
+    thread that can never boot Julia) can report natural-scale numbers. `pooled_fit`
+    asserts it against Julia's own inverse transform.
+    """
+    theta = np.asarray(theta_transformed, dtype=float)
+    return np.where([n in LOG_SCALED for n in names], np.exp(theta), theta)
 
 
 def pooled_reference(estimator: str = "laplace", ghq_level: int = 5, seed: int = DEFAULT_SEED):
@@ -160,11 +222,17 @@ def pooled_fit(estimator: str = "laplace", ghq_level: int = 5, seed: int = DEFAU
     # Re-evaluate the objective at theta* through the same primitive the sites use,
     # so the federated/pooled comparison cannot differ by bookkeeping.
     value, _ = objective_and_gradient(nl, dm, theta, estimator, ghq_level)
+    names = [str(s) for s in nl.seval("nlf_names")(dm)]
+    natural = np.asarray(nl.seval("nlf_natural_vec")(dm, theta), dtype=float)
+    # LOG_SCALED must agree with the model string, or the server would report and
+    # compare the wrong numbers.
+    if not np.allclose(natural, to_natural(theta, names), rtol=1e-12, atol=0.0):
+        raise RuntimeError(f"LOG_SCALED does not match the model transform for {names}")
     return {
-        "names": [str(s) for s in nl.seval("nlf_names")(dm)],
+        "names": names,
         "theta0": [float(v) for v in nl.seval("nlf_theta0")(dm)],
         "theta_transformed": theta.tolist(),
-        "theta_natural": to_natural(theta).tolist(),
+        "theta_natural": natural.tolist(),
         "value": value,
     }
 

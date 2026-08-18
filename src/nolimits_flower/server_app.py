@@ -77,7 +77,11 @@ def broadcast(grid: Grid, theta: np.ndarray, config: ConfigRecord, rnd: int):
         )
         for nid in node_ids
     ]
+
+    # Actual information is sent and received back
     replies = list(grid.send_and_receive(messages))
+
+    # Received information is processed 
     if len(replies) != len(node_ids):
         missing = set(node_ids) - {r.metadata.src_node_id for r in replies}
         raise SiteFailure(
@@ -133,7 +137,7 @@ def _fit(grid: Grid, context: Context) -> None:
     names = ref["names"]
     x0 = np.asarray(ref["theta0"], dtype=float)  # the model's default theta
     log(INFO, "estimator=%s data-seed=%d params=%s start(natural)=%s",
-        estimator, seed, names, task.to_natural(x0))
+        estimator, seed, names, task.to_natural(x0, names))
 
     rounds = 0
     t0 = time.perf_counter()
@@ -161,7 +165,7 @@ def _fit(grid: Grid, context: Context) -> None:
     final = broadcast(grid, res.x, config, rnd=rounds + 1)
     rounds += 1
     fed_value = sum(v for _, v, _ in final)
-    fed_natural = task.to_natural(res.x)
+    fed_natural = task.to_natural(res.x, names)
 
     log(INFO, "converged=%s (%s)", res.success, res.message)
     log(INFO, "federated theta*(natural) = %s", dict(zip(names, fed_natural.tolist())))

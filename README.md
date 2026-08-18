@@ -11,6 +11,64 @@ contributions **is** the pooled marginal log-likelihood and its gradient, so the
 optimum is the pooled `fit_model` optimum, not an approximation of it. This is exact
 federated NLME, not an averaging heuristic.
 
+## The model
+
+The demo federates a warfarin population PK model: a single 100 mg oral dose, one
+compartment with first-order absorption, and multiplicative log-normal random effects on
+absorption rate, clearance and volume. It is the same shape as the theophylline example in
+NoLimitsPy, with warfarin-typical values (`ka` 1/h, `cl` L/h, `v` L, concentrations mg/L).
+
+```julia
+@fixedEffects begin
+    ka       = RealNumber(1.0)
+    cl       = RealNumber(0.13)
+    v        = RealNumber(8.0)
+    omega_ka = RealNumber(0.4, scale=:log)
+    omega_cl = RealNumber(0.3, scale=:log)
+    omega_v  = RealNumber(0.2, scale=:log)
+    sigma    = RealNumber(0.5, scale=:log)
+end
+
+@covariates begin
+    t    = Covariate()
+    Dose = ConstantCovariate(constant_on=:ID)
+end
+
+@randomEffects begin
+    eta_ka = RandomEffect(LogNormal(0.0, omega_ka); column=:ID)
+    eta_cl = RandomEffect(LogNormal(0.0, omega_cl); column=:ID)
+    eta_v  = RandomEffect(LogNormal(0.0, omega_v);  column=:ID)
+end
+
+@preDifferentialEquation begin
+    kai = ka * eta_ka
+    cli = cl * eta_cl
+    vi  = v * eta_v
+end
+
+@DifferentialEquation begin
+    D(depot)   ~ -kai * depot
+    D(central) ~ kai * depot - (cli / vi) * central
+end
+
+@initialDE begin
+    depot   = Dose
+    central = 0.0
+end
+
+@formulas begin
+    cp = central(t) / vi
+    conc ~ Normal(cp, sigma)
+end
+```
+
+Twenty-four subjects are sampled at 0.5, 1, 2, 4, 8, 24, 36, 48, 72, 96 and 120 h. The
+random effects enter nonlinearly and the parameters mix scales (the structural parameters
+are plain, the variance parameters are `scale=:log`), which is the realistic case for the
+federated gradient: this is a genuine ODE mixed-effects fit, not a linear toy. The ODE is
+linear in the states, so NoLimits takes its closed-form fast path and one site objective
+plus gradient evaluation costs about 50 ms after compilation.
+
 ## How it works
 
 One L-BFGS-B objective evaluation is one federated round:
@@ -38,17 +96,25 @@ within 1e-6 relative, every natural-scale parameter within 1e-3 relative.
 
 | data-seed | rounds | wall | federated loglik | pooled loglik | loglik rel.diff | worst parameter rel.diff |
 |---|---|---|---|---|---|---|
-| 20260818 | 14 | 53.8 s | -123.8749019813 | -123.8749019826 | 5.5e-12 | 2.7e-06 (omega) |
-| 20260819 | 11 | 54.5 s | -119.2722299325 | -119.2722299326 | 2.1e-11 | 2.4e-06 |
+| 20260818 | 45 | 286.8 s | -324.1753622672 | -324.1753625815 | 9.7e-10 | 1.2e-04 (omega_ka) |
+| 20260819 | 43 | 302.1 s | -335.5802494858 | -335.5802492634 | 6.6e-10 | 1.0e-04 (omega_v) |
 
 Per-parameter for seed 20260818:
 
 | parameter | federated | pooled | rel.diff |
 |---|---|---|---|
-| A0 | 9.66228678 | 9.66226779 | 2.0e-06 |
-| k | 0.28862568 | 0.28862559 | 3.2e-07 |
-| omega | 0.26601657 | 0.26601586 | 2.7e-06 |
-| sigma | 0.55779218 | 0.55779281 | 1.1e-06 |
+| ka | 1.00529192 | 1.00530383 | 1.2e-05 |
+| cl | 0.11996099 | 0.11996090 | 7.1e-07 |
+| v | 8.01790190 | 8.01790057 | 1.7e-07 |
+| omega_ka | 0.39776485 | 0.39781141 | 1.2e-04 |
+| omega_cl | 0.40613069 | 0.40612379 | 1.7e-05 |
+| omega_v | 0.23978401 | 0.23978801 | 1.7e-05 |
+| sigma | 0.48382927 | 0.48382740 | 3.9e-06 |
+
+Wall is the federated loop only (the rounds), excluding the one-off model compilation in
+each site process and the pooled reference fit. The additivity of the site quantities is
+exact: at the true theta the three site log-likelihoods sum to the pooled value with
+relative difference 1.7e-16, and the summed gradients match the pooled gradient to 1.1e-14.
 
 The residual parameter differences are optimizer tolerance, not federation error: the site
 contributions themselves agree with the pooled quantity to floating-point precision.
@@ -170,9 +236,10 @@ pytest tests -m slow -q -s        # federated fit plus the fault-injection abort
 ```
 
 The fast tests need neither Julia nor a federation and run in seconds. The slow tests submit
-real `flwr run` invocations and poll `flwr log`: about 3 minutes together on a laptop
-(equivalence 111 s, fault injection 79 s). `.github/workflows/ci.yml` runs the fast tests on
-every push and the slow suite with a 45 minute ceiling.
+real `flwr run` invocations and poll `flwr log`: 793 s together on a laptop, dominated by the
+equivalence run (a 45 round federated fit plus the pooled reference fit, with one model
+compilation per site process). `.github/workflows/ci.yml` runs the fast tests on every push
+and the slow suite with a 45 minute ceiling.
 
 ## Deployment outlook
 

@@ -33,14 +33,44 @@ def test_partition_rejects_more_sites_than_subjects():
 def test_simulate_is_deterministic_per_seed():
     a, b = task.simulate(seed=1), task.simulate(seed=1)
     assert a.equals(b)
-    assert not np.allclose(a["y"], task.simulate(seed=2)["y"])
+    assert not np.allclose(a["conc"], task.simulate(seed=2)["conc"])
     assert task.partition(a, 3)[0].equals(task.partition(b, 3)[0])
 
 
+def test_simulated_concentrations_are_plausible():
+    df = task.simulate()
+    assert (df["Dose"] == task.DOSE).all()
+    peak = df.groupby("ID")["conc"].max()
+    # 100 mg into ~8 L, so peaks land around 10 mg/L, and absorption is fast enough that
+    # the profile has already peaked before the first design time.
+    assert peak.between(4.0, 25.0).all()
+    late = df[df["t"] == max(task.TIMES)]["conc"]
+    assert (late < peak.to_numpy()).all()
+
+
 def test_theta_scale_round_trip():
-    # Every fixed effect is scale=:log, so the wire (transformed) scale is log/exp.
-    natural = np.array([task.TRUE_THETA[n] for n in task.PARAM_NAMES])
-    assert np.allclose(task.to_natural(np.log(natural)), natural)
+    # Mixed scales: exp/log for the omegas and sigma, identity for ka, cl, v.
+    names = list(task.PARAM_NAMES)
+    natural = np.array([task.TRUE_THETA[n] for n in names])
+    transformed = np.where([n in task.LOG_SCALED for n in names], np.log(natural), natural)
+    assert np.allclose(task.to_natural(transformed, names), natural)
+    assert not np.allclose(transformed, natural)  # the scales really do differ
+
+
+def test_log_scaled_matches_the_model_string():
+    """LOG_SCALED is the Julia-free copy of the model's transform; keep them in sync."""
+    declared = {
+        line.split("=")[0].strip()
+        for line in task.MODEL.splitlines()
+        if "RealNumber(" in line and "scale=:log" in line
+    }
+    assert declared == set(task.LOG_SCALED)
+    plain = {
+        line.split("=")[0].strip()
+        for line in task.MODEL.splitlines()
+        if "RealNumber(" in line and "scale=:log" not in line
+    }
+    assert declared | plain == set(task.PARAM_NAMES)
 
 
 def test_unknown_estimator_is_rejected():
