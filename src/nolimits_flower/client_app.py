@@ -24,27 +24,25 @@ log(INFO, "NoLimitsPy booted on thread %r (main=%s)", BOOT_THREAD, BOOT_ON_MAIN)
 
 app = ClientApp()
 
-_site_dms: dict[tuple[int, int], object] = {}
+_site_dms: dict[tuple[int, int, int], object] = {}
 
 
 def _site_dm(context: Context):
-    key = (int(context.node_config["partition-id"]), int(context.node_config["num-partitions"]))
+    """This site's DataModel, built once per (partition, data seed) per process."""
+    key = (
+        int(context.node_config["partition-id"]),
+        int(context.node_config["num-partitions"]),
+        int(context.run_config["data-seed"]),
+    )
     if key not in _site_dms:
-        pid, num = key
-        _site_dms[key] = task.build_data_model(nl, task.partition(task.simulate(), num)[pid])
+        pid, num, seed = key
+        df = task.partition(task.simulate(seed=seed), num)[pid]
+        _site_dms[key] = task.build_data_model(nl, df)
     return _site_dms[key]
 
 
 @app.query()
 def site_objective(msg: Message, context: Context) -> Message:
-    log(
-        INFO,
-        "site %s: handler on thread %r (main=%s), booted on %r",
-        context.node_config["partition-id"],
-        threading.current_thread().name,
-        threading.current_thread() is threading.main_thread(),
-        BOOT_THREAD,
-    )
     config = msg.content["config"]
     theta = msg.content["theta"].to_numpy_ndarrays()[0]
     value, gradient = task.objective_and_gradient(

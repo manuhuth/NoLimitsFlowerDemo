@@ -5,17 +5,26 @@ Federated nonlinear mixed-effects estimation with [Flower](https://flower.ai) an
 site; sites exchange only the marginal log-likelihood (and later its gradient) at a
 common parameter vector.
 
-Status: Phase 2. `flwr run .` runs one verification round: the server broadcasts the true
-simulation theta (transformed scale), each of 3 sites answers with
-`objective_and_gradient(Laplace(), dm_site, theta)`, and the summed value and gradient are
-compared against the same call on the pooled data set. Observed on the seeded demo data:
+Status: Phase 3. `flwr run .` runs the federated fit. The server optimizes the
+transformed-scale theta with scipy L-BFGS-B (`jac=True`); one objective evaluation is one
+federated round, in which every site answers with
+`objective_and_gradient(Laplace(), dm_site, theta)` and the server sums the values and
+gradients. Because the sites hold disjoint subjects, that sum IS the pooled marginal
+log-likelihood and its gradient, so the optimum is the pooled `fit_model` optimum. The
+server never runs Julia; the pooled reference fit runs in a child process.
+
+Observed on the seeded demo data (3 sites, 8 subjects each):
 
 ```
-sites=3 summed value=-126.0322291370 pooled value=-126.0322291370 rel=4.510e-16
-gradient rel-diffs=[1.50e-16 0 0 0] (worst 1.503e-16)
+seed 20260818: 14 rounds, 55.0 s   loglik -123.8749019826  (pooled -123.8749019827, rel 1.6e-11)
+               A0 9.66228678 / 9.66226779   k 0.28862568 / 0.28862559
+               omega 0.26601657 / 0.26601586   sigma 0.55779218 / 0.55779281   worst rel 2.7e-06
+seed 20260819: 11 rounds, 54.5 s   loglik -119.2722299325  (pooled -119.2722299326, rel 2.1e-11)
+               worst parameter rel.diff 2.4e-06
 ```
 
-The federated optimizer loop is Phase 3.
+Acceptance thresholds enforced by the run: objective within 1e-6 relative, every
+natural-scale parameter within 1e-3 relative.
 
 ## Development setup
 
@@ -69,3 +78,12 @@ flwr run . --stream --federation-config \
 ```
 
 `init-args-num-cpus=2` with one CPU per ClientApp gives 3 sites, 2 running at a time.
+
+Run config knobs (`--run-config`): `data-seed` (the simulated data set; a second seed must
+also pass the acceptance), `estimator` (`laplace`, or `ghq` with `ghq-level`), `max-rounds`
+(the federated-round cap, passed to L-BFGS-B as `maxfun`). The `ghq` path optimizes but has
+no acceptance assertion yet:
+
+```bash
+flwr run . --stream --run-config 'estimator="ghq" max-rounds=4' --federation-config ...
+```

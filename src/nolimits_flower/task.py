@@ -47,6 +47,7 @@ PARAM_NAMES = tuple(TRUE_THETA)
 
 N_SUBJECTS = 24
 TIMES = (0.5, 1.0, 2.0, 4.0)
+DEFAULT_SEED = 20260818
 
 # Defined once per Julia session; `nlf_objgrad` is the only thing the client calls.
 JULIA_HELPERS = """
@@ -65,6 +66,13 @@ end
 
 nlf_names(dm) = string.(keys(NoLimits.get_params(dm, scale = :untransformed)))
 
+# The model's own default theta, already on the transformed scale: the federated
+# optimizer's start point and (by construction) fit_model's own start point.
+nlf_theta0(dm) = Vector{Float64}(NoLimits.get_params(dm, scale = :transformed))
+
+# A fit's theta* as a plain vector (ComponentArrays do not cross the wrappers).
+nlf_fit_theta(fit) = Vector{Float64}(NoLimits.get_params(fit, scale = :transformed))
+
 function nlf_natural(dm, v)
     ax, inv = nlf_axes(dm)
     inv(NoLimits.ComponentArrays.ComponentArray(collect(Float64, v), ax))
@@ -78,7 +86,7 @@ end
 """
 
 
-def simulate(seed: int = 20260818, n_subjects: int = N_SUBJECTS) -> pd.DataFrame:
+def simulate(seed: int = DEFAULT_SEED, n_subjects: int = N_SUBJECTS) -> pd.DataFrame:
     """Seeded synthetic data at TRUE_THETA: n_subjects x len(TIMES) observations."""
     rng = np.random.default_rng(seed)
     p = TRUE_THETA
@@ -119,24 +127,59 @@ def true_theta_transformed(nl, dm) -> np.ndarray:
     return np.log([TRUE_THETA[n] for n in names])  # every fixed effect is scale=:log
 
 
-def pooled_reference(estimator: str = "laplace", ghq_level: int = 5, seed: int = 20260818):
-    """(theta_transformed, value, gradient) for the UNPARTITIONED data set.
+def to_natural(theta_transformed) -> np.ndarray:
+    """Transformed -> natural scale. Every fixed effect is scale=:log, so this is exp."""
+    return np.exp(np.asarray(theta_transformed, dtype=float))
 
-    Boots Julia in the calling process, so call it where the main thread is free.
-    `python -m nolimits_flower.task <estimator> <ghq_level>` runs it as its own
-    process and prints the result as JSON; that is how server_app gets it.
+
+def pooled_reference(estimator: str = "laplace", ghq_level: int = 5, seed: int = DEFAULT_SEED):
+    """(theta_transformed, value, gradient) at TRUE_THETA for the UNPARTITIONED data.
+
+    The Phase-2 additivity check: sum over sites of the same call must equal this.
     """
     import NoLimitsPy as nl
 
     dm = build_data_model(nl, simulate(seed=seed))
     theta = true_theta_transformed(nl, dm)
     value, gradient = objective_and_gradient(nl, dm, theta, estimator, ghq_level)
-    return theta, value, gradient
+    return {"theta": theta.tolist(), "value": value, "gradient": gradient.tolist()}
+
+
+def pooled_fit(estimator: str = "laplace", ghq_level: int = 5, seed: int = DEFAULT_SEED):
+    """The pooled `fit_model` reference plus the shared start point and axes order.
+
+    Boots Julia in the calling process, so run it where the main thread is free:
+    `python -m nolimits_flower.task fit <estimator> <ghq_level> <seed>` prints this
+    as JSON, which is how the ServerApp (a worker thread) gets it.
+    """
+    import NoLimitsPy as nl
+
+    dm = build_data_model(nl, simulate(seed=seed))
+    fit = nl.fit_model(dm, _method(nl, estimator, ghq_level))
+    theta = np.asarray(nl.seval("nlf_fit_theta")(fit), dtype=float)
+    # Re-evaluate the objective at theta* through the same primitive the sites use,
+    # so the federated/pooled comparison cannot differ by bookkeeping.
+    value, _ = objective_and_gradient(nl, dm, theta, estimator, ghq_level)
+    return {
+        "names": [str(s) for s in nl.seval("nlf_names")(dm)],
+        "theta0": [float(v) for v in nl.seval("nlf_theta0")(dm)],
+        "theta_transformed": theta.tolist(),
+        "theta_natural": to_natural(theta).tolist(),
+        "value": value,
+    }
+
+
+def _method(nl, estimator: str, ghq_level: int):
+    if estimator == "laplace":
+        return nl.Laplace()
+    if estimator == "ghq":
+        return nl.GHQuadrature(level=ghq_level)
+    raise ValueError(f"unknown estimator {estimator!r} (expected 'laplace' or 'ghq')")
 
 
 def objective_and_gradient(nl, dm, theta_transformed: np.ndarray, estimator: str, ghq_level: int):
     """(value, gradient) for one DataModel at a transformed-scale wire vector."""
-    method = nl.Laplace() if estimator == "laplace" else nl.GHQuadrature(level=ghq_level)
+    method = _method(nl, estimator, ghq_level)
     value, grad = nl.seval("nlf_objgrad")(dm, np.asarray(theta_transformed, dtype=float), method)
     value = float(value)
     grad = np.asarray(grad, dtype=float)
@@ -145,14 +188,17 @@ def objective_and_gradient(nl, dm, theta_transformed: np.ndarray, estimator: str
     return value, grad
 
 
-if __name__ == "__main__":  # `python -m nolimits_flower.task laplace 5` -> JSON on stdout
+if __name__ == "__main__":
+    # `python -m nolimits_flower.task {fit|objgrad} [estimator] [ghq_level] [seed]`
+    # -> one "POOLED_JSON {...}" line on stdout.
     import json
     import sys
 
-    theta, value, gradient = pooled_reference(
-        sys.argv[1] if len(sys.argv) > 1 else "laplace",
-        int(sys.argv[2]) if len(sys.argv) > 2 else 5,
+    mode = sys.argv[1] if len(sys.argv) > 1 else "fit"
+    args = (
+        sys.argv[2] if len(sys.argv) > 2 else "laplace",
+        int(sys.argv[3]) if len(sys.argv) > 3 else 5,
+        int(sys.argv[4]) if len(sys.argv) > 4 else DEFAULT_SEED,
     )
-    print("POOLED_JSON " + json.dumps(
-        {"theta": theta.tolist(), "value": value, "gradient": gradient.tolist()}
-    ))
+    result = pooled_fit(*args) if mode == "fit" else pooled_reference(*args)
+    print("POOLED_JSON " + json.dumps(result))

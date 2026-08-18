@@ -27,3 +27,5 @@ clientapp = "nolimits_flower.client_app:app"
 [tool.flwr.app.config]
 estimator = "laplace"
 ghq-level = 5
+data-seed = 20260818
+max-rounds = 100
