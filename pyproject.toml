@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nolimits-flower"
+version = "0.1.0"
+description = "Federated nonlinear mixed-effects estimation with Flower and NoLimitsPy"
+requires-python = ">=3.11"
+dependencies = [
+    "flwr[simulation]>=1.33.0",
+    "numpy",
+    "pandas",
+    "scipy",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.flwr.app]
+publisher = "manuhuth"
+
+[tool.flwr.app.components]
+serverapp = "nolimits_flower.server_app:app"
+clientapp = "nolimits_flower.client_app:app"
+
+[tool.flwr.app.config]
+num-server-rounds = 3
