@@ -15,7 +15,7 @@ import json
 import subprocess
 import sys
 import time
-from logging import INFO
+from logging import ERROR, INFO
 
 import numpy as np
 from flwr.app import ArrayRecord, ConfigRecord, Context, Message, RecordDict
@@ -44,6 +44,27 @@ def pooled_fit(estimator: str, ghq_level: int, seed: int) -> dict:
     return json.loads(line[len("POOLED_JSON "):])
 
 
+class SiteFailure(RuntimeError):
+    """One site failed, so the federated sum is incomplete and the fit must abort."""
+
+
+# node id -> site id, learned from successful replies: an error reply carries no
+# content, so this is the only way to name the site rather than just the node.
+_SITE_OF_NODE: dict[int, int] = {}
+
+
+def _short_reason(error) -> str:
+    """The site's own exception message out of the framework's nested traceback dump."""
+    reason = str(getattr(error, "reason", error) or "")
+    marker = "Message: "
+    if marker in reason:
+        reason = reason.rsplit(marker, 1)[1]
+    lines = [l.strip() for l in reason.splitlines() if l.strip()]
+    text = (lines[0] if lines else "no reason reported").rstrip("'\">").strip()
+    code = getattr(error, "code", None)
+    return f"{text[:300]} (error code {code})" if code is not None else text[:300]
+
+
 def broadcast(grid: Grid, theta: np.ndarray, config: ConfigRecord, rnd: int):
     """Send theta to every node; return [(site_id, value, gradient)]. Raises on any failure."""
     node_ids = list(grid.get_node_ids())
@@ -58,30 +79,54 @@ def broadcast(grid: Grid, theta: np.ndarray, config: ConfigRecord, rnd: int):
     ]
     replies = list(grid.send_and_receive(messages))
     if len(replies) != len(node_ids):
-        raise RuntimeError(f"round {rnd}: {len(replies)}/{len(node_ids)} sites replied")
+        missing = set(node_ids) - {r.metadata.src_node_id for r in replies}
+        raise SiteFailure(
+            f"round {rnd}: only {len(replies)}/{len(node_ids)} sites replied; no reply from "
+            f"{[(_SITE_OF_NODE.get(n, '?'), n) for n in sorted(missing)]} (site, node) - "
+            "aborting the federated fit rather than summing a subset of the sites"
+        )
     out = []
     for reply in replies:
+        node = reply.metadata.src_node_id
         if not reply.has_content():
-            raise RuntimeError(f"round {rnd}: site error: {reply.error}")
+            raise SiteFailure(
+                f"round {rnd}: site {_SITE_OF_NODE.get(node, 'unknown (first round)')} "
+                f"(node {node}) failed: {_short_reason(reply.error)} - aborting the federated "
+                "fit rather than summing the remaining sites; see that node's ClientApp log"
+            )
         metrics = reply.content["result"]
+        site_id = int(metrics["site-id"])
+        _SITE_OF_NODE[node] = site_id
         value = float(metrics["value"])
         gradient = reply.content["gradient"].to_numpy_ndarrays()[0]
         # A -Inf / NaN site contribution (failed solve) must never be summed.
         if not np.isfinite(value) or not np.all(np.isfinite(gradient)):
-            raise RuntimeError(
-                f"round {rnd}: non-finite contribution from site {metrics['site-id']} "
-                f"(value={value}) - aborting the federated fit"
+            raise SiteFailure(
+                f"round {rnd}: non-finite contribution from site {site_id} (node {node}, "
+                f"value={value}) - aborting the federated fit"
             )
-        out.append((int(metrics["site-id"]), value, gradient))
+        out.append((site_id, value, gradient))
     return out
 
 
 @app.main()
 def main(grid: Grid, context: Context) -> None:
+    """Wrapper: a site failure aborts with one actionable line, not a nested traceback."""
+    try:
+        _fit(grid, context)
+    except SiteFailure as exc:
+        log(ERROR, "FEDERATED FIT ABORTED: %s", exc)
+        raise SiteFailure(str(exc)) from None
+
+
+def _fit(grid: Grid, context: Context) -> None:
     estimator = str(context.run_config["estimator"])
     ghq_level = int(context.run_config["ghq-level"])
     seed = int(context.run_config["data-seed"])
     max_rounds = int(context.run_config["max-rounds"])
+    fail_site = int(context.run_config["fail-site"])
+    if fail_site >= 0:
+        log(INFO, "fault injection active (testing only): site %d will raise", fail_site)
     config = ConfigRecord({"estimator": estimator, "ghq-level": ghq_level})
 
     ref = pooled_fit(estimator, ghq_level, seed)

@@ -44,6 +44,11 @@ def _site_dm(context: Context):
 @app.query()
 def site_objective(msg: Message, context: Context) -> Message:
     config = msg.content["config"]
+    site_id = int(context.node_config["partition-id"])
+    # TESTING ONLY: run-config `fail-site=<id>` makes that site raise, to verify the
+    # server aborts the whole fit instead of summing the surviving sites.
+    if site_id == int(context.run_config["fail-site"]):
+        raise RuntimeError(f"fault injection: site {site_id} refuses to answer")
     theta = msg.content["theta"].to_numpy_ndarrays()[0]
     value, gradient = task.objective_and_gradient(
         nl,
