@@ -36,7 +36,8 @@ clientapp = "nolimits_flower.client_app:app"
 [tool.flwr.app.config]
 estimator = "laplace"
 ghq-level = 5
-data-seed = 20260818
+data-source = "warfarin"  # or "simulated" for the seeded synthetic demo
+data-seed = 20260818  # which simulated data set; ignored by data-source="warfarin"
 max-rounds = 100
 fail-site = -1  # testing only: make this site id raise in its handler
 

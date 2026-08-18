@@ -35,7 +35,7 @@ from nolimits_flower import task
 app = ServerApp()
 
 
-def pooled_fit(estimator: str, ghq_level: int, seed: int) -> dict:
+def pooled_fit(estimator: str, ghq_level: int, seed: int, source: str) -> dict:
     """Pooled `fit_model` reference from a child process with its own Julia.
 
     DEMO ONLY: this is the acceptance comparison for the simulated demo, run after the
@@ -47,7 +47,8 @@ def pooled_fit(estimator: str, ghq_level: int, seed: int) -> dict:
     simulation process's log pipe blocked the child indefinitely.
     """
     proc = subprocess.run(
-        [sys.executable, "-m", "nolimits_flower.task", "fit", estimator, str(ghq_level), str(seed)],
+        [sys.executable, "-m", "nolimits_flower.task", "fit", estimator, str(ghq_level),
+         str(seed), source],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
@@ -200,6 +201,7 @@ def _fit(grid: Grid, context: Context) -> None:
     estimator = str(context.run_config["estimator"])
     ghq_level = int(context.run_config["ghq-level"])
     seed = int(context.run_config["data-seed"])
+    source = str(context.run_config["data-source"])
     max_rounds = int(context.run_config["max-rounds"])
     fail_site = int(context.run_config["fail-site"])
     if fail_site >= 0:
@@ -211,8 +213,8 @@ def _fit(grid: Grid, context: Context) -> None:
     t_prep = time.perf_counter()
     names, x0 = prepare(grid, config)
     log(INFO, "prepare round wall=%.1fs", time.perf_counter() - t_prep)
-    log(INFO, "estimator=%s data-seed=%d params=%s start(natural)=%s",
-        estimator, seed, names, task.to_natural(x0, names))
+    log(INFO, "estimator=%s data-source=%s data-seed=%d params=%s start(natural)=%s",
+        estimator, source, seed, names, task.to_natural(x0, names))
 
     rounds = 0
     t0 = time.perf_counter()
@@ -253,7 +255,7 @@ def _fit(grid: Grid, context: Context) -> None:
 
     # DEMO ONLY, and only now that the fit is done: the pooled reference the acceptance
     # table compares against. Production deployments delete this call.
-    ref = pooled_fit(estimator, ghq_level, seed)
+    ref = pooled_fit(estimator, ghq_level, seed, source)
     if ref["names"] != names:
         raise RuntimeError(f"pooled reference parameter order {ref['names']} != sites' {names}")
     pooled_natural = np.asarray(ref["theta_natural"], dtype=float)
@@ -261,7 +263,8 @@ def _fit(grid: Grid, context: Context) -> None:
     value_rel = abs(fed_value - pooled_value) / abs(pooled_value)
     theta_rel = np.abs(fed_natural - pooled_natural) / np.abs(pooled_natural)
 
-    log(INFO, "ACCEPTANCE (federated vs pooled fit_model, data-seed=%d)", seed)
+    log(INFO, "ACCEPTANCE (federated vs pooled fit_model, data-source=%s data-seed=%d)",
+        source, seed)
     log(INFO, "  %-8s %14s %14s %10s", "param", "federated", "pooled", "rel.diff")
     for name, f, p, r in zip(names, fed_natural, pooled_natural, theta_rel):
         log(INFO, "  %-8s %14.8f %14.8f %10.2e", name, f, p, r)

@@ -73,6 +73,42 @@ def test_log_scaled_matches_the_model_string():
     assert declared | plain == set(task.PARAM_NAMES)
 
 
+warfarin_cached = pytest.mark.skipif(
+    not task.WARFARIN_CACHE.exists(),
+    reason="needs data/warfarin.csv; one online run or `python -m nolimits_flower.task fit` "
+           "writes it",
+)
+
+
+@warfarin_cached
+def test_warfarin_pk_extraction():
+    df = task.warfarin()
+    assert list(df.columns) == ["ID", "t", "Dose", "conc"]
+    assert not df.isna().any().any()
+    assert df["ID"].nunique() == 30  # 32 dosed subjects, 30 with the loader's baseline record
+    # Dose is a ConstantCovariate(constant_on=:ID) in the model, so it must be one value
+    # per subject, and the real doses differ between subjects (60 to 153 mg).
+    assert (df.groupby("ID")["Dose"].nunique() == 1).all()
+    assert df["Dose"].nunique() > 1
+    assert (df["t"] > 0).all() and (df["conc"] >= 0).all()
+
+
+@warfarin_cached
+def test_warfarin_partitions_into_three_sites():
+    sites = task.partition(task.dataset("warfarin"), 3)
+    assert [s["ID"].nunique() for s in sites] == [10, 10, 10]
+    assert sum(len(s) for s in sites) == len(task.warfarin())
+
+
+def test_dataset_rejects_an_unknown_source():
+    with pytest.raises(ValueError, match="unknown data-source"):
+        task.dataset("nonsense")
+
+
+def test_dataset_simulated_is_the_simulation():
+    assert task.dataset("simulated", seed=7).equals(task.simulate(seed=7))
+
+
 def test_unknown_estimator_is_rejected():
     with pytest.raises(ValueError, match="unknown estimator"):
         task._method(nl=None, estimator="saem", ghq_level=5)

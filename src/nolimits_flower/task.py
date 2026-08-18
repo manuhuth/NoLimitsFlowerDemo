@@ -17,6 +17,8 @@ exactly the coordinates the server optimizes in. All of that lives in one Julia
 helper defined once per process (`JULIA_HELPERS`).
 """
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
@@ -82,13 +84,26 @@ DOSE = 100.0
 TIMES = (0.5, 1.0, 2.0, 4.0, 8.0, 24.0, 36.0, 48.0, 72.0, 96.0, 120.0)
 DEFAULT_SEED = 20260818
 
+DEFAULT_SOURCE = "warfarin"
+# Raw Monolix warfarin frame, written on the first download and read from then on, so
+# repeat runs and the tests need no network. Gitignored: data is not package content.
+WARFARIN_CACHE = Path(__file__).resolve().parents[2] / "data" / "warfarin.csv"
+
 # Defined once per Julia session; `nlf_objgrad` is the only thing the client calls.
 JULIA_HELPERS = """
-isdefined(NoLimits, :objective_and_gradient) || error(
-    "this NoLimits build has no objective_and_gradient; point PYTHON_JULIAPKG_PROJECT " *
-    "at a Julia project tracking NoLimits main (see the README dev section)")
+(isdefined(NoLimits, :objective_and_gradient) && isdefined(NoLimits, :build_fit_context)) ||
+    error("this NoLimits build has no objective_and_gradient/build_fit_context; point " *
+    "PYTHON_JULIAPKG_PROJECT at a Julia project tracking NoLimits main (see the README " *
+    "dev section)")
 
 const NLF_CACHE = IdDict()
+const NLF_CTX = IdDict()
+
+# One FitContext per site DataModel, built in the prepare round. It carries the batch
+# infos, the constants cache and the evaluation cache, so a round no longer rebuilds
+# them. The `dm` form of objective_and_gradient remains valid and gives the same
+# numbers; it just redoes that setup on every call.
+nlf_ctx(dm) = get!(() -> NoLimits.build_fit_context(dm), NLF_CTX, dm)
 
 function nlf_axes(dm)
     get!(NLF_CACHE, dm) do
@@ -123,8 +138,20 @@ end
 
 # (value, gradient-on-transformed-axes) at the transformed-scale wire vector.
 function nlf_objgrad(dm, v, method)
-    val, grad = NoLimits.objective_and_gradient(method, dm, nlf_natural(dm, v), scale = "transformed")
+    val, grad = NoLimits.objective_and_gradient(
+        method, nlf_ctx(dm), nlf_natural(dm, v), scale = "transformed")
     (Float64(val), Vector{Float64}(grad))
+end
+"""
+
+# Downloads the Monolix warfarin data through NoLimits' own loader and writes the raw
+# frame to the cache. Only ever runs when the cache is missing.
+WARFARIN_JULIA = """
+import CSV
+function nlf_warfarin_cache(path)
+    mkpath(dirname(path))
+    CSV.write(path, NoLimits.load_warfarin_from_monolix())
+    return path
 end
 """
 
@@ -151,6 +178,42 @@ def simulate(seed: int = DEFAULT_SEED, n_subjects: int = N_SUBJECTS) -> pd.DataF
     return pd.DataFrame({
         "ID": [f"S{i:02d}" for i in ids], "t": t, "Dose": DOSE, "conc": conc,
     })
+
+
+def warfarin(nl=None) -> pd.DataFrame:
+    """The Monolix warfarin PK data in this model's columns (ID, t, Dose, conc).
+
+    NoLimits' own `load_warfarin_from_monolix()` downloads the joint PK/PD frame (32
+    dosed subjects, 30 of which have the baseline INR record the loader requires, hence
+    30 in the returned frame). The PK rows are the ones with a non-missing `C`; `d` is
+    the per-subject dose the loader already carried forward to every row, which is what
+    the model's `ConstantCovariate(constant_on=:ID)` wants.
+
+    The download happens once: the raw frame is cached at `data/warfarin.csv` and every
+    later call (and every test) reads the cache, so repeat runs are offline.
+    """
+    if not WARFARIN_CACHE.exists():
+        if nl is None:
+            import NoLimitsPy as nl
+        nl.seval(WARFARIN_JULIA)
+        nl.seval("nlf_warfarin_cache")(str(WARFARIN_CACHE))
+    raw = pd.read_csv(WARFARIN_CACHE)
+    pk = raw[raw["C"].notna()]
+    return pd.DataFrame({
+        "ID": pk["id"].astype(str).to_numpy(),
+        "t": pk["t"].to_numpy(dtype=float),
+        "Dose": pk["d"].to_numpy(dtype=float),
+        "conc": pk["C"].to_numpy(dtype=float),
+    })
+
+
+def dataset(source: str = DEFAULT_SOURCE, seed: int = DEFAULT_SEED, nl=None) -> pd.DataFrame:
+    """The data to federate: the real warfarin PK data, or the seeded simulation."""
+    if source == "warfarin":
+        return warfarin(nl)
+    if source == "simulated":
+        return simulate(seed=seed)
+    raise ValueError(f"unknown data-source {source!r} (expected 'warfarin' or 'simulated')")
 
 
 def partition(df: pd.DataFrame, num_sites: int) -> list[pd.DataFrame]:
@@ -194,29 +257,36 @@ def to_natural(theta_transformed, names) -> np.ndarray:
     return np.where([n in LOG_SCALED for n in names], np.exp(theta), theta)
 
 
-def pooled_reference(estimator: str = "laplace", ghq_level: int = 5, seed: int = DEFAULT_SEED):
-    """(theta_transformed, value, gradient) at TRUE_THETA for the UNPARTITIONED data.
+def pooled_reference(estimator: str = "laplace", ghq_level: int = 5, seed: int = DEFAULT_SEED,
+                     source: str = DEFAULT_SOURCE):
+    """(theta_transformed, value, gradient) at the additivity-check theta, unpartitioned.
 
-    The Phase-2 additivity check: sum over sites of the same call must equal this.
+    Sum over sites of the same call must equal this. The check theta is TRUE_THETA for
+    the simulation and the model's own default theta0 for the real warfarin data, where
+    no true theta exists.
     """
     import NoLimitsPy as nl
 
-    dm = build_data_model(nl, simulate(seed=seed))
-    theta = true_theta_transformed(nl, dm)
+    dm = build_data_model(nl, dataset(source, seed, nl))
+    theta = (
+        true_theta_transformed(nl, dm) if source == "simulated"
+        else np.asarray(nl.seval("nlf_theta0")(dm), dtype=float)
+    )
     value, gradient = objective_and_gradient(nl, dm, theta, estimator, ghq_level)
     return {"theta": theta.tolist(), "value": value, "gradient": gradient.tolist()}
 
 
-def pooled_fit(estimator: str = "laplace", ghq_level: int = 5, seed: int = DEFAULT_SEED):
+def pooled_fit(estimator: str = "laplace", ghq_level: int = 5, seed: int = DEFAULT_SEED,
+               source: str = DEFAULT_SOURCE):
     """The pooled `fit_model` reference plus the shared start point and axes order.
 
     Boots Julia in the calling process, so run it where the main thread is free:
-    `python -m nolimits_flower.task fit <estimator> <ghq_level> <seed>` prints this
+    `python -m nolimits_flower.task fit <estimator> <ghq_level> <seed> <source>` prints this
     as JSON, which is how the ServerApp (a worker thread) gets it.
     """
     import NoLimitsPy as nl
 
-    dm = build_data_model(nl, simulate(seed=seed))
+    dm = build_data_model(nl, dataset(source, seed, nl))
     fit = nl.fit_model(dm, _method(nl, estimator, ghq_level))
     theta = np.asarray(nl.seval("nlf_fit_theta")(fit), dtype=float)
     # Re-evaluate the objective at theta* through the same primitive the sites use,
@@ -257,7 +327,7 @@ def objective_and_gradient(nl, dm, theta_transformed: np.ndarray, estimator: str
 
 
 if __name__ == "__main__":
-    # `python -m nolimits_flower.task {fit|objgrad} [estimator] [ghq_level] [seed]`
+    # `python -m nolimits_flower.task {fit|objgrad} [estimator] [ghq_level] [seed] [source]`
     # -> one "POOLED_JSON {...}" line on stdout.
     import json
     import sys
@@ -267,6 +337,7 @@ if __name__ == "__main__":
         sys.argv[2] if len(sys.argv) > 2 else "laplace",
         int(sys.argv[3]) if len(sys.argv) > 3 else 5,
         int(sys.argv[4]) if len(sys.argv) > 4 else DEFAULT_SEED,
+        sys.argv[5] if len(sys.argv) > 5 else DEFAULT_SOURCE,
     )
     result = pooled_fit(*args) if mode == "fit" else pooled_reference(*args)
     print("POOLED_JSON " + json.dumps(result))

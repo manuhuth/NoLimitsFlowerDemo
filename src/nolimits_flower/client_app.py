@@ -2,7 +2,7 @@
 
 Two handlers:
 - `query.prepare` (once per run, before the optimizer) builds this site's DataModel
-  and burns ONE warm-up objective call, so the ~85 s of Julia boot + model codegen +
+  and its FitContext, and burns ONE warm-up objective call, so the ~85 s of Julia boot + model codegen +
   DataModel build is paid in a round of its own instead of hiding inside optimization
   round 1. It also reports this site's parameter names and the model-default
   transformed theta0, which is where the server gets its start point from.
@@ -34,22 +34,25 @@ log(INFO, "NoLimitsPy booted on thread %r (main=%s)", BOOT_THREAD, BOOT_ON_MAIN)
 
 app = ClientApp()
 
-_site_dms: dict[tuple[int, int, int], object] = {}
-_site_subjects: dict[tuple[int, int, int], int] = {}
+_site_dms: dict[tuple, object] = {}
+_site_subjects: dict[tuple, int] = {}
+
+
+def _site_key(context: Context) -> tuple:
+    return (
+        int(context.node_config["partition-id"]),
+        int(context.node_config["num-partitions"]),
+        str(context.run_config["data-source"]),
+        int(context.run_config["data-seed"]),
+    )
 
 
 def _site_dm(context: Context):
-    """This site's DataModel, built once per (partition, data seed) per process."""
-    key = (
-        int(context.node_config["partition-id"]),
-        int(context.node_config["num-partitions"]),
-        int(context.run_config["data-seed"]),
-    )
+    """This site's DataModel, built once per (partition, data source) per process."""
+    key = _site_key(context)
     if key not in _site_dms:
-        pid, num, seed = key
-        df = task.partition(task.simulate(seed=seed), num)[pid]
-        # TODO(#273): once NoLimits issue #273 (FitContext methods) merges, also build a
-        # FitContext for this DataModel here and switch site_objective to the ctx call.
+        pid, num, source, seed = key
+        df = task.partition(task.dataset(source, seed, nl), num)[pid]
         _site_dms[key] = task.build_data_model(nl, df)
         _site_subjects[key] = int(df["ID"].nunique())
     return _site_dms[key]
@@ -61,15 +64,13 @@ def prepare(msg: Message, context: Context) -> Message:
     config = msg.content["config"]
     t0 = time.perf_counter()
     dm = _site_dm(context)
+    # The FitContext (batch infos + caches) that every later round evaluates through.
+    nl.seval("nlf_ctx")(dm)
     theta0 = np.asarray(nl.seval("nlf_theta0")(dm), dtype=float)
     # Discarded: its only job is to pay the first-call compilation cost here.
     task.objective_and_gradient(nl, dm, theta0, str(config["estimator"]), int(config["ghq-level"]))
     setup_seconds = time.perf_counter() - t0
-    key = (
-        int(context.node_config["partition-id"]),
-        int(context.node_config["num-partitions"]),
-        int(context.run_config["data-seed"]),
-    )
+    key = _site_key(context)
     log(INFO, "prepare: site %d ready in %.1fs", key[0], setup_seconds)
     return Message(
         content=RecordDict({
