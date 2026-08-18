@@ -10,6 +10,7 @@ echoed into the test output for the record.
 """
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -26,9 +27,12 @@ FLWR = str(Path(sys.executable).parent / "flwr")
 
 
 def _flwr(*args: str, timeout: float) -> str:
+    # flwr shells out to `flower-superlink`/`flower-superexec` by bare name, so the venv's
+    # bin directory has to be on PATH even when the venv is not activated.
+    env = {**os.environ, "PATH": f"{Path(FLWR).parent}{os.pathsep}{os.environ['PATH']}"}
     proc = subprocess.run(
         [FLWR, *args],
-        cwd=REPO, capture_output=True, text=True, timeout=timeout,
+        cwd=REPO, capture_output=True, text=True, timeout=timeout, env=env,
     )
     return proc.stdout + proc.stderr
 

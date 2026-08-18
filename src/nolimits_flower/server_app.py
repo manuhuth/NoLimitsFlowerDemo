@@ -1,14 +1,21 @@
 """ServerApp: the federated fit, plus the pooled-fit acceptance comparison.
 
-One L-BFGS-B objective evaluation == one federated round: broadcast the
-transformed-scale theta, collect each site's (value, gradient), sum them. The sum
-is the pooled marginal log-likelihood and its gradient exactly (disjoint subjects),
-so the optimum is the pooled `fit_model` optimum.
+A run is one PREPARE round followed by pure evaluation rounds:
+
+- prepare: every site builds its DataModel and burns one warm-up objective call, so
+  the ~85 s of Julia boot + codegen + DataModel build is visible as its own round
+  instead of hiding inside optimization round 1. The sites also report the parameter
+  names and the model-default transformed theta0 - that is where the fit's start
+  point comes from, so the optimizer needs no Julia anywhere on the server side.
+- each subsequent L-BFGS-B objective evaluation == one federated round: broadcast the
+  transformed-scale theta, collect each site's (value, gradient), sum them. The sum
+  is the pooled marginal log-likelihood and its gradient exactly (disjoint subjects),
+  so the optimum is the pooled `fit_model` optimum.
 
 The ServerApp itself never touches Julia: in the simulation runtime `@app.main`
 runs on a worker thread and juliacall can only cold-boot Julia from a process's
-main thread. Anything needing Julia (the pooled reference fit, the model's default
-theta, the parameter names) comes from a child process whose main thread is free.
+main thread. The only Julia-in-a-child-process left is the pooled reference fit,
+which runs AFTER convergence purely for the demo acceptance comparison.
 """
 
 import json
@@ -30,6 +37,11 @@ app = ServerApp()
 
 def pooled_fit(estimator: str, ghq_level: int, seed: int) -> dict:
     """Pooled `fit_model` reference from a child process with its own Julia.
+
+    DEMO ONLY: this is the acceptance comparison for the simulated demo, run after the
+    federated fit has converged. Production deployments do not run it - there is no
+    pooled dataset, and the federated fit needs nothing from it (theta0 and the
+    parameter names come from the prepare round).
 
     Its output is captured rather than inherited: Julia's chatter into the
     simulation process's log pipe blocked the child indefinitely.
@@ -65,15 +77,15 @@ def _short_reason(error) -> str:
     return f"{text[:300]} (error code {code})" if code is not None else text[:300]
 
 
-def broadcast(grid: Grid, theta: np.ndarray, config: ConfigRecord, rnd: int):
-    """Send theta to every node; return [(site_id, value, gradient)]. Raises on any failure."""
+def _send_all(grid: Grid, message_type: str, records: dict, label: str):
+    """Send the same content to every node; return the replies. Raises on any failure."""
     node_ids = list(grid.get_node_ids())
     messages = [
         Message(
-            content=RecordDict({"theta": ArrayRecord([theta]), "config": config}),
-            message_type="query",
+            content=RecordDict(dict(records)),
+            message_type=message_type,
             dst_node_id=nid,
-            group_id=str(rnd),
+            group_id=label,
         )
         for nid in node_ids
     ]
@@ -81,23 +93,84 @@ def broadcast(grid: Grid, theta: np.ndarray, config: ConfigRecord, rnd: int):
     # Actual information is sent and received back
     replies = list(grid.send_and_receive(messages))
 
-    # Received information is processed 
+    # Received information is processed
     if len(replies) != len(node_ids):
         missing = set(node_ids) - {r.metadata.src_node_id for r in replies}
         raise SiteFailure(
-            f"round {rnd}: only {len(replies)}/{len(node_ids)} sites replied; no reply from "
+            f"{label}: only {len(replies)}/{len(node_ids)} sites replied; no reply from "
             f"{[(_SITE_OF_NODE.get(n, '?'), n) for n in sorted(missing)]} (site, node) - "
             "aborting the federated fit rather than summing a subset of the sites"
         )
-    out = []
     for reply in replies:
-        node = reply.metadata.src_node_id
         if not reply.has_content():
+            node = reply.metadata.src_node_id
             raise SiteFailure(
-                f"round {rnd}: site {_SITE_OF_NODE.get(node, 'unknown (first round)')} "
+                f"{label}: site {_SITE_OF_NODE.get(node, 'unknown (first round)')} "
                 f"(node {node}) failed: {_short_reason(reply.error)} - aborting the federated "
                 "fit rather than summing the remaining sites; see that node's ClientApp log"
             )
+    return replies
+
+
+def agree(sites: list[tuple[int, list[str], np.ndarray]]) -> tuple[list[str], np.ndarray]:
+    """Collapse the sites' prepare replies to the one (names, theta0) they must all share.
+
+    The sites run the same model, so a disagreement means they are not fitting the same
+    thing and the summed objective would be meaningless. Pure function: unit-tested.
+    """
+    if not sites:
+        raise SiteFailure("prepare round: no sites reported")
+    ref_id, names, theta0 = sites[0]
+    for site_id, other_names, other_theta0 in sites[1:]:
+        if other_names != names:
+            raise SiteFailure(
+                f"prepare round: site {site_id} reports parameter names {other_names} but "
+                f"site {ref_id} reports {names} - the sites are not running the same model"
+            )
+        if not np.array_equal(other_theta0, theta0):
+            raise SiteFailure(
+                f"prepare round: site {site_id} reports theta0 {list(other_theta0)} but site "
+                f"{ref_id} reports {list(theta0)} - the sites are not running the same model"
+            )
+    return list(names), np.asarray(theta0, dtype=float)
+
+
+def prepare(grid: Grid, config: ConfigRecord) -> tuple[list[str], np.ndarray]:
+    """The prepare round: warm every site, log the setup table, source names/theta0.
+
+    ponytail: one message per node, no retries. In the SIMULATION runtime Ray actors are
+    not pinned to a node, so an actor serving several partitions still builds the ones it
+    has not seen inside round 1; give each site its own actor to avoid that. In deployment
+    (one process per site) this round absorbs the whole setup cost.
+    """
+    replies = _send_all(grid, "query.prepare", {"config": config}, "prepare round")
+    sites = []
+    log(INFO, "PREPARE ROUND (%d sites)", len(replies))
+    log(INFO, "  %-6s %9s %14s", "site", "subjects", "setup (s)")
+    for reply in sorted(replies, key=lambda r: int(r.content["result"]["site-id"])):
+        metrics = reply.content["result"]
+        site_id = int(metrics["site-id"])
+        _SITE_OF_NODE[reply.metadata.src_node_id] = site_id
+        if not int(metrics["ready"]):
+            raise SiteFailure(f"prepare round: site {site_id} did not report ready")
+        log(INFO, "  %-6d %9d %14.1f", site_id, int(metrics["subjects"]),
+            float(metrics["setup-seconds"]))
+        sites.append((
+            site_id,
+            [str(n) for n in reply.content["names"]["names"]],
+            reply.content["theta0"].to_numpy_ndarrays()[0],
+        ))
+    return agree(sites)
+
+
+def broadcast(grid: Grid, theta: np.ndarray, config: ConfigRecord, rnd: int):
+    """Send theta to every node; return [(site_id, value, gradient)]. Raises on any failure."""
+    replies = _send_all(
+        grid, "query", {"theta": ArrayRecord([theta]), "config": config}, f"round {rnd}"
+    )
+    out = []
+    for reply in replies:
+        node = reply.metadata.src_node_id
         metrics = reply.content["result"]
         site_id = int(metrics["site-id"])
         _SITE_OF_NODE[node] = site_id
@@ -133,9 +206,11 @@ def _fit(grid: Grid, context: Context) -> None:
         log(INFO, "fault injection active (testing only): site %d will raise", fail_site)
     config = ConfigRecord({"estimator": estimator, "ghq-level": ghq_level})
 
-    ref = pooled_fit(estimator, ghq_level, seed)
-    names = ref["names"]
-    x0 = np.asarray(ref["theta0"], dtype=float)  # the model's default theta
+    # Prepare round: sites warm up and hand over the shared start point. No Julia on the
+    # server, and every later round is a pure warm evaluation.
+    t_prep = time.perf_counter()
+    names, x0 = prepare(grid, config)
+    log(INFO, "prepare round wall=%.1fs", time.perf_counter() - t_prep)
     log(INFO, "estimator=%s data-seed=%d params=%s start(natural)=%s",
         estimator, seed, names, task.to_natural(x0, names))
 
@@ -145,10 +220,12 @@ def _fit(grid: Grid, context: Context) -> None:
     def federated(x: np.ndarray):
         nonlocal rounds
         rounds += 1
+        t_round = time.perf_counter()
         sites = broadcast(grid, np.asarray(x, dtype=float), config, rnd=rounds)
         value = sum(v for _, v, _ in sites)
         grad = np.sum([g for _, _, g in sites], axis=0)
-        log(INFO, "round %d: loglik=%.10f |grad|=%.3e sites=%d", rounds, value, np.linalg.norm(grad), len(sites))
+        log(INFO, "round %d: loglik=%.10f |grad|=%.3e sites=%d wall=%.2fs", rounds, value,
+            np.linalg.norm(grad), len(sites), time.perf_counter() - t_round)
         return -value, -grad  # L-BFGS-B minimizes; the sites report a log-likelihood
 
     # maxfun caps function evaluations, i.e. federated rounds - the round guard. maxiter
@@ -169,10 +246,16 @@ def _fit(grid: Grid, context: Context) -> None:
 
     log(INFO, "converged=%s (%s)", res.success, res.message)
     log(INFO, "federated theta*(natural) = %s", dict(zip(names, fed_natural.tolist())))
-    log(INFO, "federated loglik=%.10f rounds=%d wall=%.1fs", fed_value, rounds, wall)
+    log(INFO, "federated loglik=%.10f evaluation rounds=%d wall=%.1fs (%.2fs/round)",
+        fed_value, rounds, wall, wall / max(rounds, 1))
     for site_id, value, _ in sorted(final):
         log(INFO, "  site %d contribution: %.10f", site_id, value)
 
+    # DEMO ONLY, and only now that the fit is done: the pooled reference the acceptance
+    # table compares against. Production deployments delete this call.
+    ref = pooled_fit(estimator, ghq_level, seed)
+    if ref["names"] != names:
+        raise RuntimeError(f"pooled reference parameter order {ref['names']} != sites' {names}")
     pooled_natural = np.asarray(ref["theta_natural"], dtype=float)
     pooled_value = float(ref["value"])
     value_rel = abs(fed_value - pooled_value) / abs(pooled_value)

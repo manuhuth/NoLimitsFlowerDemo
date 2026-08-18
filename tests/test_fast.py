@@ -87,6 +87,30 @@ def test_known_estimators_reach_the_wrapper():
     assert task._method(FakeNl, "ghq", 7) == "ghq-7"
 
 
+def test_agree_returns_the_shared_names_and_theta0():
+    theta0 = np.array([1.0, -0.9])
+    names, out = server_app.agree([
+        (0, ["ka", "omega_ka"], theta0),
+        (1, ["ka", "omega_ka"], theta0.copy()),
+    ])
+    assert names == ["ka", "omega_ka"]
+    assert np.array_equal(out, theta0)
+
+
+@pytest.mark.parametrize("bad", [
+    (1, ["ka", "omega_cl"], np.array([1.0, -0.9])),   # different names
+    (1, ["ka", "omega_ka"], np.array([1.0, -0.8])),    # different theta0
+])
+def test_agree_rejects_a_site_running_another_model(bad):
+    with pytest.raises(server_app.SiteFailure, match="not running the same model"):
+        server_app.agree([(0, ["ka", "omega_ka"], np.array([1.0, -0.9])), bad])
+
+
+def test_agree_rejects_an_empty_prepare_round():
+    with pytest.raises(server_app.SiteFailure, match="no sites reported"):
+        server_app.agree([])
+
+
 def test_short_reason_extracts_the_site_exception():
     class Error:
         code = 2

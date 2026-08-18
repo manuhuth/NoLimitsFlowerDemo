@@ -71,12 +71,43 @@ plus gradient evaluation costs about 50 ms after compilation.
 
 ## How it works
 
-One L-BFGS-B objective evaluation is one federated round:
+A run is one prepare round followed by pure evaluation rounds.
+
+**Round 0, prepare.** The server broadcasts the run configuration to every site. Each site
+builds its own `DataModel` and burns one throwaway `objective_and_gradient` call at the
+model's default theta, then replies with a ready flag, its setup wall time, its subject
+count, its parameter names and the model-default transformed theta0. This is where the
+one-off cost lives: Julia boot plus model codegen plus the first evaluation is about 85 s
+per site, against about 0.05 s for a warm one. Paying it in a round of its own keeps it out
+of optimization round 1 and makes it visible in the log:
+
+```
+PREPARE ROUND (3 sites)
+  site   subjects      setup (s)
+  0             8           84.9
+  1             8           85.3
+  2             8           82.4
+```
+
+Caveat specific to the *simulation* runtime: Ray's ClientAppActors are not pinned to a
+node, so with fewer actors than sites (`init-args-num-cpus=2`, 3 sites) one actor serves
+several partitions and pays a build for each partition it has not seen yet. Measured: after
+a 170 s prepare round, round 1 still cost 129 s and every round after it 0.1 s. Give each
+site its own actor (`init-args-num-cpus` >= number of sites) if you want the prepare round
+to absorb all of it. In deployment the question does not arise: one SuperNode per site, one
+process, one DataModel.
+
+The server asserts that every site reports ready and that all sites report *identical*
+names and theta0 (they run the same model, so a mismatch means they do not, and the summed
+objective would be meaningless). The agreed theta0 is the fit's start point, so the server
+needs no Julia at all for the optimization.
+
+**Every following round** is one L-BFGS-B objective evaluation:
 
 1. The server broadcasts the current transformed-scale theta to every site.
 2. Each site computes `objective_and_gradient(Laplace(), dm_site, theta)` over its own
-   subjects (the Laplace marginal likelihood finds its own empirical-Bayes modes) and
-   replies with the scalar value and the gradient vector.
+   subjects (the Laplace marginal likelihood finds its own empirical-Bayes modes) on its
+   already-warm DataModel and replies with the scalar value and the gradient vector.
 3. The server sums the values and the gradients and hands them to L-BFGS-B (`jac=True`).
 
 Theta crosses the wire on the transformed (unconstrained) scale, so positivity constraints
@@ -178,11 +209,18 @@ The `ghq` path optimizes and reports, but has no acceptance assertion yet.
 ## Architecture
 
 ```
-server_app.py   ServerApp: L-BFGS-B over the summed site (value, gradient); acceptance check
-client_app.py   ClientApp: one site, Julia warmed at import, answers theta with aggregates
+server_app.py   ServerApp: prepare round, then L-BFGS-B over the summed site
+                (value, gradient); demo-only pooled comparison after convergence
+client_app.py   ClientApp: one site; Julia warmed at import; `query.prepare` builds and
+                warms the DataModel, `query` answers theta with aggregates
 task.py         model string, simulation, partitioning, theta glue, pooled reference
                 (no Flower imports, so it is unit-testable without a federation)
 ```
+
+The server side of the fit is Julia-free: names and the start theta come from the prepare
+round, not from a local model build. The pooled `fit_model` reference still runs, but only
+after convergence and only to produce the demo's acceptance table - a production deployment
+has no pooled dataset and deletes that call.
 
 Three constraints of the flwr 1.33 simulation runtime shape this code and are worth knowing
 before changing it:
@@ -196,11 +234,10 @@ before changing it:
   place a live Julia object survives across rounds.
 - **Server worker-thread constraint.** The ServerApp runs on a worker thread
   (`server_th_with_start_checks`), so it can never boot Julia in-process.
-- **Child-process pattern.** Everything server side that needs Julia (the pooled reference
-  fit, the parameter names, the model's default start theta) runs as
-  `python -m nolimits_flower.task fit ...`, a child process whose main thread is free, with
-  its output **captured**. Letting the child inherit the simulation's log pipe and write
-  Julia's chatter into it deadlocked the child.
+- **Child-process pattern.** The one remaining server-side Julia user, the demo's pooled
+  reference fit, runs as `python -m nolimits_flower.task fit ...`, a child process whose main
+  thread is free, with its output **captured**. Letting the child inherit the simulation's
+  log pipe and write Julia's chatter into it deadlocked the child.
 
 Flower's per-run runtime environment does not pass `PYTHON_JULIAPKG_*` through to the
 ServerApp and ClientApp processes, so `nolimits_flower/__init__.py` re-pins `julia_env/`
