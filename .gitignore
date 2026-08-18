@@ -1,0 +1,9 @@
+.venv/
+julia_env/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+*.png
+.DS_Store
+PLAN.md
+.flwr-local/
