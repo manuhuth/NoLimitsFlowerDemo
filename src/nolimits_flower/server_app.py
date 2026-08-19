@@ -8,9 +8,11 @@ A run is one PREPARE round followed by pure evaluation rounds:
   names and the model-default transformed theta0 - that is where the fit's start
   point comes from, so the optimizer needs no Julia anywhere on the server side.
 - each subsequent L-BFGS-B objective evaluation == one federated round: broadcast the
-  transformed-scale theta, collect each site's (value, gradient), sum them. The sum
-  is the pooled marginal log-likelihood and its gradient exactly (disjoint subjects),
-  so the optimum is the pooled `fit_model` optimum.
+  transformed-scale theta, collect each site's (value, gradient), sum them. Every wired
+  estimator (laplace, focei, ghq, pooled) is a sum of per-subject terms, so with disjoint
+  subjects the sum IS the pooled-data objective and gradient exactly, and the optimum is
+  the pooled `fit_model` optimum. `PARAM_TOL` and the ghq branch below record where that
+  identity survives the *optimizer* and where it only survives in the objective.
 
 The ServerApp itself never touches Julia: in the simulation runtime `@app.main`
 runs on a worker thread and juliacall can only cold-boot Julia from a process's
@@ -33,6 +35,26 @@ from scipy.optimize import minimize
 from nolimits_flower import task
 
 app = ServerApp()
+
+# All four estimators sum over subjects, so the summed site contributions ARE the
+# pooled objective and its gradient - measured to <=1e-15 relative for every one of them
+# by `python -m nolimits_flower.task probe`. Pooled's exactness is model-conditional (see
+# the README estimator table), hence the log line below.
+# Parameter-wise acceptance tolerance per estimator; the objective tolerance is 1e-6 for
+# all of them (`ghq` is gated one-sidedly instead, see the acceptance block). `pooled` gets
+# 1e-2 because its plug-in eta is the RE mean exp(omega^2/2), so the objective is nearly
+# FLAT in the omegas: measured, the two fits agree to 3.1e-10 in the objective while
+# omega_cl differs by 6.2e-03 - a plateau, not a federation error.
+PARAM_TOL = {"laplace": 1.0e-3, "focei": 1.0e-3, "pooled": 1.0e-2}
+
+POOLED_CAVEAT = (
+    "estimator=pooled: exact here because every random effect is LogNormal, so the "
+    "plug-in eta strategy resolves to :mean, a function of theta alone. A model whose "
+    "plug-in resolution depends on the DATA (a normalizing-flow RE, or a strategy "
+    "demoted for ForwardDiff-safety on one site's data only) would calibrate per site "
+    "and break additivity - re-run `python -m nolimits_flower.task probe` after changing "
+    "the model."
+)
 
 
 def pooled_fit(estimator: str, ghq_level: int, seed: int, source: str) -> dict:
@@ -282,13 +304,33 @@ def _fit(grid: Grid, context: Context) -> None:
         log(INFO, "  %-8s %14.8f %14.8f %10.2e", name, f, p, r)
     log(INFO, "  %-8s %14.8f %14.8f %10.2e", "loglik", fed_value, pooled_value, value_rel)
 
-    if estimator != "laplace":
-        log(INFO, "estimator=%s: smoke run only, no acceptance assertion", estimator)
+    if estimator == "pooled":
+        log(INFO, "%s", POOLED_CAVEAT)
+    if estimator == "ghq":
+        # GHQ's quadrature objective is ROUGH on this model - NoLimits itself warns that
+        # levels above 3 can cancel in the signed logsumexp, and a batch can fall back to
+        # the level-1 rule - so scipy's L-BFGS-B and fit_model's Optim LBFGS settle in
+        # different local optima and a parameter-wise gate is unreachable in either
+        # direction (measured: at level 3 the federated optimum is 3.1e-02 BETTER than
+        # fit_model's, at level 5 2.3e-02 worse). What federation has to guarantee is that
+        # the summed site objective IS the pooled objective (the additivity probe: 2e-16)
+        # and that optimizing it loses nothing, so the gate here is one-sided.
+        if fed_value < pooled_value - 1.0e-6 * abs(pooled_value):
+            raise RuntimeError(
+                f"acceptance failed: federated GHQ optimum {fed_value:.8f} is worse than the "
+                f"pooled fit_model optimum {pooled_value:.8f} (rel {value_rel:.3e}); the "
+                "objective is exactly additive, so this is an optimizer-path loss - lower "
+                "ghq-level (levels 1-3 are the numerically stable range) or raise max-rounds"
+            )
+        log(INFO, "PASS: federated GHQ optimum is no worse than the pooled fit (%.8f vs "
+            "%.8f); parameter-wise agreement is not claimed for GHQ, see the README",
+            fed_value, pooled_value)
         return
-    if value_rel >= 1e-6 or theta_rel.max() >= 1e-3:
+    theta_tol = PARAM_TOL[estimator]
+    if value_rel >= 1e-6 or theta_rel.max() >= theta_tol:
         raise RuntimeError(
             f"acceptance failed: objective rel {value_rel:.3e} (tol 1e-6), "
-            f"worst parameter rel {theta_rel.max():.3e} (tol 1e-3)"
+            f"worst parameter rel {theta_rel.max():.3e} (tol {theta_tol:.0e})"
         )
     log(INFO, "PASS: federated optimum matches the pooled fit (objective %.2e, worst param %.2e)",
         value_rel, theta_rel.max())

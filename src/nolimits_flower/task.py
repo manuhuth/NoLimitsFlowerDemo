@@ -321,12 +321,56 @@ def pooled_fit(estimator: str = "laplace", ghq_level: int = 5, seed: int = DEFAU
     }
 
 
+ESTIMATORS = ("laplace", "focei", "ghq", "pooled")
+
+
+def additivity_probe(num_sites: int = 3, ghq_level: int = 5, seed: int = DEFAULT_SEED,
+                     source: str = DEFAULT_SOURCE):
+    """Per-estimator additivity: sum over sites of (value, gradient) vs the pooled-data call.
+
+    One Julia boot, one model codegen, 1 + num_sites DataModels, evaluated at the model's
+    own default theta0 (identical for every DataModel, since it comes from MODEL). All four
+    estimators are per-subject sums on this model and come out additive to ~1e-16; `pooled`
+    is the one whose exactness is model-conditional (see `server_app.POOLED_CAVEAT`), which
+    is why this probe measures rather than assumes.
+    """
+    import NoLimitsPy as nl
+
+    df = dataset(source, seed, nl)
+    pooled_dm = build_data_model(nl, df)
+    site_dms = [build_data_model(nl, s) for s in partition(df, num_sites)]
+    theta = np.asarray(nl.seval("nlf_theta0")(pooled_dm), dtype=float)
+    out = {}
+    for estimator in ESTIMATORS:
+        pooled_value, pooled_grad = objective_and_gradient(
+            nl, pooled_dm, theta, estimator, ghq_level)
+        pairs = [objective_and_gradient(nl, dm, theta, estimator, ghq_level) for dm in site_dms]
+        fed_value = sum(v for v, _ in pairs)
+        fed_grad = np.sum([g for _, g in pairs], axis=0)
+        out[estimator] = {
+            "pooled_value": pooled_value,
+            "federated_value": fed_value,
+            "value_rel": abs(fed_value - pooled_value) / abs(pooled_value),
+            "gradient_rel": float(
+                np.linalg.norm(fed_grad - pooled_grad) / np.linalg.norm(pooled_grad)
+            ),
+            "worst_gradient_coord_rel": float(
+                np.max(np.abs(fed_grad - pooled_grad) / np.maximum(np.abs(pooled_grad), 1e-12))
+            ),
+        }
+    return {"theta": theta.tolist(), "sites": num_sites, "source": source, "probes": out}
+
+
 def _method(nl, estimator: str, ghq_level: int):
     if estimator == "laplace":
         return nl.Laplace()
+    if estimator == "focei":
+        return nl.FOCEI()
     if estimator == "ghq":
         return nl.GHQuadrature(level=ghq_level)
-    raise ValueError(f"unknown estimator {estimator!r} (expected 'laplace' or 'ghq')")
+    if estimator == "pooled":
+        return nl.Pooled()
+    raise ValueError(f"unknown estimator {estimator!r} (expected one of {ESTIMATORS})")
 
 
 def objective_and_gradient(nl, dm, theta_transformed: np.ndarray, estimator: str, ghq_level: int):
@@ -341,8 +385,9 @@ def objective_and_gradient(nl, dm, theta_transformed: np.ndarray, estimator: str
 
 
 if __name__ == "__main__":
-    # `python -m nolimits_flower.task {fit|objgrad} [estimator] [ghq_level] [seed] [source]`
-    # -> one "POOLED_JSON {...}" line on stdout.
+    # `python -m nolimits_flower.task {fit|objgrad|probe} [estimator] [ghq_level] [seed] [source]`
+    # -> one "POOLED_JSON {...}" line on stdout. `probe` reads the estimator slot as the
+    # site count (it covers all estimators in one boot).
     import json
     import sys
 
@@ -353,5 +398,8 @@ if __name__ == "__main__":
         int(sys.argv[4]) if len(sys.argv) > 4 else DEFAULT_SEED,
         sys.argv[5] if len(sys.argv) > 5 else DEFAULT_SOURCE,
     )
-    result = pooled_fit(*args) if mode == "fit" else pooled_reference(*args)
+    if mode == "probe":
+        result = additivity_probe(int(args[0]) if args[0].isdigit() else 3, *args[1:])
+    else:
+        result = pooled_fit(*args) if mode == "fit" else pooled_reference(*args)
     print("POOLED_JSON " + json.dumps(result))

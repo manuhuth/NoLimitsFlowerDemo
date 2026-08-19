@@ -35,7 +35,7 @@ clientapp = "nolimits_flower.client_app:app"
 
 [tool.flwr.app.config]
 estimator = "laplace"
-ghq-level = 5
+ghq-level = 3  # NoLimits' own default; levels 1-3 are its numerically stable range
 data-source = "warfarin"  # or "simulated" for the seeded synthetic demo
 data-seed = 20260818  # which simulated data set; ignored by data-source="warfarin"
 max-rounds = 100

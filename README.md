@@ -130,8 +130,8 @@ needs no Julia at all for the optimization.
 **Every following round** is one L-BFGS-B objective evaluation:
 
 1. The server broadcasts the current transformed-scale theta to every site.
-2. Each site computes `objective_and_gradient(Laplace(), ctx_site, theta)` over its own
-   subjects (the Laplace marginal likelihood finds its own empirical-Bayes modes) through
+2. Each site computes `objective_and_gradient(method, ctx_site, theta)` over its own
+   subjects (with `Laplace()`, the marginal likelihood finds its own empirical-Bayes modes) through
    the `FitContext` built in the prepare round, and replies with the scalar value and the
    gradient vector. The context caches the random-effect batch infos and the evaluation
    cache: on one warfarin site that is 2.6 ms per call against 17.6 ms for the equivalent
@@ -151,15 +151,89 @@ stay implicit and the server needs no bounds. `max-rounds` caps the number of fe
 rounds through the optimizer's `maxfun`; a truncated run fails the acceptance rather than
 reporting a half-optimized theta as the optimum.
 
-Estimators: `laplace` (default) and `ghq` (Gauss-Hermite quadrature, `ghq-level`). Both are
-sums over subjects, hence exactly federable. SAEM and MCEM are not yet federated; they need
-a per-site E-step sufficient-statistics primitive upstream in NoLimits.
+## Estimators
+
+Four estimators are wired, all through the same `objective_and_gradient(method, ctx, theta)`
+protocol, so a site's handler is estimator-agnostic. Every one of them is a **sum over
+subjects**, so the summed site contributions are the pooled-data value and gradient exactly.
+Measured on the three warfarin sites at the model's default theta
+(`python -m nolimits_flower.task probe`, one Julia boot, all four estimators):
+
+| `estimator` | NoLimits method | additivity of (value, gradient) | fit acceptance | per-round cost |
+|---|---|---|---|---|
+| `laplace` (default) | `Laplace()` | value 0.0, gradient 2.1e-16 | strict: objective 1e-6, every parameter 1e-3 | 0.10 s |
+| `focei` | `FOCEI()` | value 2.0e-16, gradient 2.1e-16 | strict, same tolerances | 0.11 s |
+| `ghq` | `GHQuadrature(level=ghq-level)` | value 2.3e-16, gradient 5.9e-16 (level 5) | one-sided: no worse than the pooled fit | 0.12 s (level 3), 0.13 s (level 5) |
+| `pooled` | `Pooled()` | value 1.1e-16, gradient 1.5e-16 | objective 1e-6, parameters 1e-2 | 0.11 s |
+
+The three sums are exact for the same reason in every case: subjects are independent, and
+each estimator's objective is a per-subject (per-random-effect-batch) term. `Laplace` and
+`FOCEI` find each subject's empirical-Bayes mode from that subject's own data; `GHQuadrature`
+integrates each subject's batch on its own quadrature grid; `Pooled` plugs in a per-subject
+eta and evaluates a per-subject likelihood. Nothing in any of them couples two subjects, so
+splitting the subjects across sites cannot change the total.
+
+Two of the four need a caveat, and both caveats are about the *optimizer*, not the sums:
+
+- **`pooled` is exact here, but that is model-conditional.** `Pooled()` first *calibrates* a
+  plug-in strategy per random effect (`_pooled_plugin_strategies` in NoLimits'
+  `src/estimation/pooled.jl`) and then optimizes `loglikelihood(dm, theta, eta(theta))`. The
+  calibration looks at the data set: it probes the first individual's random-effect
+  distributions, and demotes a strategy (`:mean` to `:median` to `:zero`, or to Monte-Carlo
+  draws) if it is not ForwardDiff-safe there. In this model every random effect is
+  `LogNormal`, whose mean is finite and smooth, so every site resolves to `:mean` and the
+  plug-in eta is `exp(omega^2/2)`, a function of **theta alone** - identical on every site,
+  hence exact additivity (1.1e-16). A model where the resolution depends on the data (a
+  normalizing-flow random effect, or a strategy demoted on one site's data only) would
+  calibrate per site and the federated objective would stop being the pooled-data objective.
+  Re-run the probe after changing the model; the slow test does exactly that.
+  Its acceptance also uses a looser 1e-2 parameter tolerance: the plug-in eta depends on
+  omega only through `exp(omega^2/2)`, so the objective is nearly flat in the omegas. The two
+  fits agree to 3.1e-10 in the objective while `omega_cl` differs by 6.2e-03 - a plateau, not
+  a federation error.
+- **`ghq` gets a one-sided gate.** The quadrature objective is rough on this model: NoLimits
+  warns that levels above 3 can cancel in the signed logsumexp, and it falls back to the
+  level-1 rule for a batch when the prior-centred rule goes unstable. scipy's L-BFGS-B and
+  `fit_model`'s Optim LBFGS therefore settle in *different* local optima, and neither side
+  wins consistently - measured against the pooled `fit_model` reference, the federated
+  optimum is 5.6e-02 **better** at level 3 and 6.7e-02 worse at level 5. A parameter-wise
+  gate is unreachable in either direction, so the run asserts what federation is actually
+  responsible for: the summed objective is the pooled objective (2.3e-16), and optimizing it
+  loses nothing, i.e. the federated optimum is no worse than the pooled one. The default
+  `ghq-level` is therefore 3, NoLimits' own default and its documented stable range; level 5
+  is reported but not gated. GHQ also needs more rounds than the others (127 at level 3
+  against 34 for FOCEI), so raise `max-rounds` above its default 100 for it.
+
+SAEM and MCEM are not federated; they need a per-site E-step sufficient-statistics primitive
+upstream in NoLimits. `MLE` and `MAP` have the protocol too but require a model without
+random effects, which is not what this package is for.
 
 ## Equivalence, measured
 
 Federated fit versus the pooled `fit_model` on the same data, same model, same start point
 (the model's default theta, agreed in the prepare round). Acceptance enforced by the run:
-objective within 1e-6 relative, every natural-scale parameter within 1e-3 relative.
+objective within 1e-6 relative, every natural-scale parameter within its estimator's
+tolerance from the table above.
+
+Per estimator, on the real warfarin data, 3 sites of 10 subjects (`ghq` at level 3, which is
+the default; the run's own `max-rounds` raised to 200 for it):
+
+| `estimator` | rounds | loop wall | federated loglik | pooled loglik | loglik rel.diff | worst parameter rel.diff | verdict |
+|---|---|---|---|---|---|---|---|
+| `laplace` | 29 | 3.5 s | -403.2872869375 | -403.2872858633 | 2.7e-09 | 1.8e-04 (omega_v) | PASS (strict) |
+| `focei` | 34 | 3.8 s | -401.2000213813 | -401.1999998500 | 5.4e-08 | 8.9e-04 (omega_v) | PASS (strict) |
+| `ghq`, level 3 | 127 | 15.4 s | -394.5270561672 | -417.8769948600 | 5.6e-02 (federated better) | 9.8e-01 | PASS (one-sided) |
+| `ghq`, level 5 | 67 | 6.9 s | -433.2232828373 | -406.1255437100 | 6.7e-02 (federated worse) | 1.5e-01 | reported, gate fails |
+| `pooled` | 28 | 4.0 s | -473.9759462922 | -473.9759461400 | 3.1e-10 | 6.2e-03 (omega_cl) | PASS (1e-2 parameters) |
+
+Loop wall excludes the prepare round (48 to 132 s, one model compilation plus three
+`DataModel` builds in a single Ray actor) and the pooled reference fit. Per-round cost is
+almost identical across estimators (0.10 to 0.14 s, of which a few ms is the actual site
+call), so what separates them is the number of rounds their objective needs. The `ghq`
+level-5 row is the documented failure of the *fit* comparison, not of the federation: its
+additivity is 2.3e-16 and both sides simply converge to different local optima of a rough
+quadrature objective, with `fit_model` winning at level 5 and the federated fit winning at
+level 3.
 
 | data-source | sites | subjects | rounds | wall | federated loglik | pooled loglik | loglik rel.diff | worst parameter rel.diff |
 |---|---|---|---|---|---|---|---|---|
@@ -195,7 +269,8 @@ round after prepare re-pays a DataModel build, see the caveat under *How it work
 The residual parameter differences are optimizer tolerance, not federation error: the site
 contributions themselves are exact. At the true theta of the simulated data the three site
 log-likelihoods sum to the pooled value with relative difference 1.7e-16 and the summed
-gradients match the pooled gradient to 1.1e-14.
+gradients match the pooled gradient to 1.1e-14; on the real warfarin data the same holds for
+all four estimators (the additivity table above).
 
 Both runs now end with `CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH`; on the raw
 transformed scale the same fits ended with the cosmetic `ABNORMAL_TERMINATION_IN_LNSRCH`
@@ -252,18 +327,28 @@ Run-config knobs (`--run-config 'key=value ...'`):
 
 | key | default | meaning |
 |---|---|---|
-| `estimator` | `"laplace"` | `laplace`, or `ghq` for Gauss-Hermite quadrature |
-| `ghq-level` | 5 | quadrature level when `estimator="ghq"` |
+| `estimator` | `"laplace"` | `laplace`, `focei`, `ghq` (Gauss-Hermite quadrature) or `pooled` (naive-pooled plug-in); see *Estimators* |
+| `ghq-level` | 3 | quadrature level when `estimator="ghq"`; 1 to 3 is NoLimits' numerically stable range |
 | `data-source` | `"warfarin"` | the real warfarin PK data, or `"simulated"` for the seeded synthetic set |
 | `data-seed` | 20260818 | which simulated data set; ignored when `data-source="warfarin"` |
 | `max-rounds` | 100 | cap on federated rounds (L-BFGS-B `maxfun`) |
 | `fail-site` | -1 | TESTING ONLY: that site id raises in its handler |
 
+Note the embedded quotes: `--run-config` values are TOML, so a string needs its own quotes
+inside the shell quotes.
+
 ```bash
-flwr run . --stream --run-config 'estimator="ghq" max-rounds=4' --federation-config ...
+flwr run . --stream --run-config 'estimator="focei"' --federation-config ...
+flwr run . --stream --run-config 'estimator="ghq" ghq-level=3 max-rounds=200' --federation-config ...
+flwr run . --stream --run-config 'estimator="pooled"' --federation-config ...
 ```
 
-The `ghq` path optimizes and reports, but has no acceptance assertion yet.
+The estimator-agnostic additivity check needs no federation and boots Julia once for all
+four estimators:
+
+```bash
+python -m nolimits_flower.task probe        # per-site sums vs the pooled-data call
+```
 
 ## Architecture
 
@@ -333,14 +418,19 @@ it at its `-1` default.
 
 ```bash
 pytest tests -m "not slow" -q     # fast: partitioning, theta scales, config, error parsing
-pytest tests -m slow -q -s        # federated fit plus the fault-injection abort
+pytest tests -m slow -q -s        # additivity of all four estimators, the laplace
+                                  # federated fit, and the fault-injection abort
 ```
 
-The fast tests need neither Julia nor a federation and run in seconds. The slow tests submit
-real `flwr run` invocations and poll `flwr log`: 611 s together on a laptop, dominated by
-the two prepare rounds (one model compilation per run, plus one DataModel build per site)
-and the pooled reference fit; the federated loop itself is 3.3 s. `.github/workflows/ci.yml` runs the fast tests on every push
-and the slow suite with a 45 minute ceiling.
+The fast tests need neither Julia nor a federation and run in 0.4 s (24 tests: partitioning,
+theta scales, estimator-name validation, prepare-round agreement, error parsing). The three
+slow tests took 957 s together on a laptop (360 s laplace equivalence, 346 s the four-estimator
+additivity probe, 251 s the fault injection), dominated by Julia boot and model compilation -
+the federated loops themselves are seconds. The additivity probe is the one slow test that
+needs no federation: one Julia boot, all four estimators. The per-estimator *fit* acceptance
+runs (the table above) stay a report-level verification; CI keeps only the laplace
+equivalence run. `.github/workflows/ci.yml` runs the fast tests on every push and the slow
+suite with a 45 minute ceiling.
 
 ## Deployment outlook
 

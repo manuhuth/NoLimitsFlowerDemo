@@ -85,6 +85,35 @@ def test_federated_fit_matches_the_pooled_fit():
 
 
 @pytest.mark.slow
+@pytest.mark.skipif(
+    not task.WARFARIN_CACHE.exists(),
+    reason="needs the data/warfarin.csv cache; one online run writes it",
+)
+def test_site_contributions_add_up_per_estimator():
+    """Additivity of (value, gradient) over the 3 warfarin sites, for all four estimators.
+
+    One Julia boot for all of them (`python -m nolimits_flower.task probe`), no Flower.
+    All four are sums over subjects on this model and must match the pooled-data call to
+    floating point. Pooled is the fragile one: it is exact only while its plug-in eta
+    resolves from theta alone (see `server_app.POOLED_CAVEAT`), which is exactly what this
+    test would catch if the model changed.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-m", "nolimits_flower.task", "probe"],
+        cwd=REPO, capture_output=True, text=True, timeout=1800,
+    )
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    line = next(l for l in proc.stdout.splitlines() if l.startswith("POOLED_JSON "))
+    probes = json.loads(line[len("POOLED_JSON "):])["probes"]
+    for name, p in probes.items():
+        print(f"{name:8s} value_rel={p['value_rel']:.3e} gradient_rel={p['gradient_rel']:.3e}")
+    assert set(probes) == set(task.ESTIMATORS)
+    for name, p in probes.items():
+        assert p["value_rel"] < 1e-8, (name, p)
+        assert p["gradient_rel"] < 1e-8, (name, p)
+
+
+@pytest.mark.slow
 def test_one_failing_site_aborts_the_run():
     """The fault-injection knob: a site raising must abort, never yield a partial sum."""
     log = run_federated('data-source="simulated" fail-site=1 max-rounds=3', timeout=600.0)

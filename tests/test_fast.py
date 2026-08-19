@@ -127,18 +127,25 @@ def test_dataset_simulated_is_the_simulation():
     assert task.dataset("simulated", seed=7).equals(task.simulate(seed=7))
 
 
-def test_unknown_estimator_is_rejected():
+@pytest.mark.parametrize("bad", ["saem", "mcem", "mle", "", "Laplace"])
+def test_unknown_estimator_is_rejected(bad):
     with pytest.raises(ValueError, match="unknown estimator"):
-        task._method(nl=None, estimator="saem", ghq_level=5)
+        task._method(nl=None, estimator=bad, ghq_level=5)
 
 
 def test_known_estimators_reach_the_wrapper():
     class FakeNl:
         Laplace = staticmethod(lambda: "laplace-method")
+        FOCEI = staticmethod(lambda: "focei-method")
         GHQuadrature = staticmethod(lambda level: f"ghq-{level}")
+        Pooled = staticmethod(lambda: "pooled-method")
 
     assert task._method(FakeNl, "laplace", 5) == "laplace-method"
+    assert task._method(FakeNl, "focei", 5) == "focei-method"
     assert task._method(FakeNl, "ghq", 7) == "ghq-7"
+    assert task._method(FakeNl, "pooled", 5) == "pooled-method"
+    # Every advertised estimator constructs.
+    assert set(task.ESTIMATORS) == {"laplace", "focei", "ghq", "pooled"}
 
 
 def test_agree_returns_the_shared_names_and_theta0():
