@@ -92,9 +92,9 @@ WARFARIN_CACHE = Path(__file__).resolve().parents[2] / "data" / "warfarin.csv"
 # Defined once per Julia session; `nlf_objgrad` is the only thing the client calls.
 JULIA_HELPERS = """
 (isdefined(NoLimits, :objective_and_gradient) && isdefined(NoLimits, :build_fit_context)) ||
-    error("this NoLimits build has no objective_and_gradient/build_fit_context; point " *
-    "PYTHON_JULIAPKG_PROJECT at a Julia project tracking NoLimits main (see the README " *
-    "dev section)")
+    error("this NoLimits build has no objective_and_gradient/build_fit_context; they " *
+    "shipped in v0.2.6 - point PYTHON_JULIAPKG_PROJECT at a Julia project with that " *
+    "release or newer (see the README dev section)")
 
 const NLF_CACHE = IdDict()
 const NLF_CTX = IdDict()

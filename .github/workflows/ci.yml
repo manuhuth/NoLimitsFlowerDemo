@@ -17,8 +17,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Julia 1.11 is what juliapkg selects for NoLimitsPy, so the pre-release
-      # julia_env must be built with the same minor version.
+      # Julia 1.11 is what juliapkg selects for NoLimitsPy, so julia_env must be built
+      # with the same minor version.
       - uses: julia-actions/setup-julia@v2
         with:
           version: "1.11"
@@ -29,16 +29,16 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      # PRE-RELEASE: the federation primitives (objective_and_gradient) are on NoLimits
-      # main, not in the registered 0.2.5. Build one shared Julia project from main.
-      # Once NoLimits v0.2.6 is registered, replace this step with a plain
-      # Pkg.add("NoLimits") (or drop it entirely and let juliapkg resolve NoLimits),
-      # and drop the PYTHON_JULIAPKG_* pinning below.
-      - name: Build the pre-release julia_env
+      # The shared Julia project: registered NoLimits (>= 0.2.6 has the federation
+      # primitives) plus CSV for the warfarin loader. It exists only for CSV; without it
+      # juliapkg would resolve NoLimits by itself and the PYTHON_JULIAPKG_* pinning below
+      # could go too.
+      - name: Build julia_env
         run: |
           julia -e 'import Pkg; Pkg.activate("julia_env");
-                    Pkg.add(url="https://github.com/manuhuth/NoLimits.jl", rev="main");
-                    Pkg.add(["PythonCall", "CSV"]); Pkg.precompile()'
+                    Pkg.add([Pkg.PackageSpec(name="NoLimits", version="0.2.6"),
+                             Pkg.PackageSpec(name="PythonCall"),
+                             Pkg.PackageSpec(name="CSV")]); Pkg.precompile()'
 
       # Editable install: nolimits_flower/__init__.py pins julia_env/ relative to the
       # package, which only resolves to the repo checkout when installed in place.

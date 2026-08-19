@@ -285,26 +285,29 @@ python3 -m venv .venv
 .venv/bin/pip install -e . "git+https://github.com/manuhuth/NoLimitsPy"
 ```
 
-NoLimits' federation primitives (`objective_and_gradient`, `build_fit_context`) are on
-NoLimits main and not yet in a registered release, so the repo uses one shared pre-release
-Julia project (`julia_env/`, gitignored). `CSV` is there for the warfarin loader, which
-needs it as a weak dependency:
+NoLimits' federation primitives (`objective_and_gradient`, `build_fit_context`) shipped in
+**NoLimits v0.2.6**, so the shared Julia project (`julia_env/`, gitignored) now tracks the
+registered release instead of `main`. It stays because the warfarin loader needs `CSV` as a
+weak dependency and because pinning it keeps every entry point on one env:
 
 ```bash
-julia +1.11 -e 'import Pkg; Pkg.activate("julia_env"); Pkg.add(url="https://github.com/manuhuth/NoLimits.jl", rev="main"); Pkg.add(["PythonCall", "CSV"])'
+julia +1.11 -e 'import Pkg; Pkg.activate("julia_env");
+                Pkg.add([Pkg.PackageSpec(name="NoLimits", version="0.2.6"),
+                         Pkg.PackageSpec(name="PythonCall"), Pkg.PackageSpec(name="CSV")])'
 ```
 
-Refresh it with `Pkg.update()` when new Julia fixes land on main, using the same Julia the
-env was built with (`julia +1.11`; mixing minor versions invalidates the precompile cache). Run Python entry points
-outside Flower with:
+Use the same Julia minor version juliapkg selects for NoLimitsPy (`julia +1.11`); mixing
+minor versions invalidates the precompile cache. Refresh with `Pkg.update()`. Run Python
+entry points outside Flower with:
 
 ```bash
 export PYTHON_JULIAPKG_PROJECT="$PWD/julia_env"
 export PYTHON_JULIAPKG_OFFLINE=yes
 ```
 
-Once NoLimits v0.2.6 is registered, both variables and the whole `julia_env/` step go away:
-juliapkg then resolves a released NoLimits that already has the primitives.
+Drop both variables and `julia_env/` entirely if you do not need the `CSV` warfarin loader:
+juliapkg then resolves NoLimits >= 0.2.5 from the registry by itself, which is what the
+deployable counterpart of this demo does.
 
 Run the demo. Each site boots its own Julia (0.5 to 2 GB resident, one model compilation),
 so cap the simulation concurrency:
