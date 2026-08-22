@@ -42,19 +42,21 @@ def _site_key(context: Context) -> tuple:
     return (
         int(context.node_config["partition-id"]),
         int(context.node_config["num-partitions"]),
+        str(context.run_config["model"]),
         str(context.run_config["data-source"]),
         int(context.run_config["data-seed"]),
     )
 
 
 def _site_dm(context: Context):
-    """This site's DataModel, built once per (partition, data source) per process."""
+    """This site's DataModel, built once per (partition, model, data source) per process."""
     key = _site_key(context)
     if key not in _site_dms:
-        pid, num, source, seed = key
-        df = task.partition(task.dataset(source, seed, nl), num)[pid]
-        _site_dms[key] = task.build_data_model(nl, df)
-        _site_subjects[key] = int(df["ID"].nunique())
+        pid, num, model, source, seed = key
+        pid_col = task.spec(model).primary_id
+        df = task.partition(task.dataset(model, source, seed, nl), num, pid_col)[pid]
+        _site_dms[key] = task.build_data_model(nl, model, df)
+        _site_subjects[key] = int(df[pid_col].nunique())
     return _site_dms[key]
 
 
@@ -67,6 +69,7 @@ def prepare(msg: Message, context: Context) -> Message:
     # The FitContext (batch infos + caches) that every later round evaluates through.
     nl.seval("nlf_ctx")(dm)
     theta0 = np.asarray(nl.seval("nlf_theta0")(dm), dtype=float)
+    log_mask = np.asarray(nl.seval("nlf_logmask")(dm), dtype=float)
     # Discarded: its only job is to pay the first-call compilation cost here.
     task.objective_and_gradient(nl, dm, theta0, str(config["estimator"]), int(config["ghq-level"]))
     setup_seconds = time.perf_counter() - t0
@@ -75,6 +78,7 @@ def prepare(msg: Message, context: Context) -> Message:
     return Message(
         content=RecordDict({
             "theta0": ArrayRecord([theta0]),
+            "log_mask": ArrayRecord([log_mask]),
             "names": ConfigRecord({"names": [str(s) for s in nl.seval("nlf_names")(dm)]}),
             "result": MetricRecord({
                 "ready": 1,

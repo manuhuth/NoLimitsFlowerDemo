@@ -39,14 +39,10 @@ app = ServerApp()
 # All four estimators sum over subjects, so the summed site contributions ARE the
 # pooled objective and its gradient - measured to <=1e-15 relative for every one of them
 # by `python -m nolimits_flower.task probe`. Pooled's exactness is model-conditional (see
-# the README estimator table), hence the log line below.
-# Parameter-wise acceptance tolerance per estimator; the objective tolerance is 1e-6 for
-# all of them (`ghq` is gated one-sidedly instead, see the acceptance block). `pooled` gets
-# 1e-2 because its plug-in eta is the RE mean exp(omega^2/2), so the objective is nearly
-# FLAT in the omegas: measured, the two fits agree to 3.1e-10 in the objective while
-# omega_cl differs by 6.2e-03 - a plateau, not a federation error.
-PARAM_TOL = {"laplace": 1.0e-3, "focei": 1.0e-3, "pooled": 1.0e-2}
-
+# the README estimator table), hence the log line below. Parameter-wise acceptance uses
+# the per-model tolerance (task.ModelSpec.param_tol, 1e-3 for the PK/growth models);
+# `ghq` is gated one-sidedly and `pooled` at 1e-2 (its plug-in eta makes the objective
+# nearly flat in the omegas). The neural model is gated on additivity, not parameters.
 POOLED_CAVEAT = (
     "estimator=pooled: exact here because every random effect is LogNormal, so the "
     "plug-in eta strategy resolves to :mean, a function of theta alone. A model whose "
@@ -57,24 +53,22 @@ POOLED_CAVEAT = (
 )
 
 
-def pooled_fit(estimator: str, ghq_level: int, seed: int, source: str) -> dict:
-    """Pooled `fit_model` reference from a child process with its own Julia.
+def _child(mode: str, model: str, estimator: str, ghq_level: int, seed: int, source: str) -> dict:
+    """Run a task CLI mode ({fit|ref|probe}) in a child process with its own Julia.
 
-    DEMO ONLY: this is the acceptance comparison for the simulated demo, run after the
-    federated fit has converged. Production deployments do not run it - there is no
-    pooled dataset, and the federated fit needs nothing from it (theta0 and the
-    parameter names come from the prepare round).
-
-    Its output is captured rather than inherited: Julia's chatter into the
-    simulation process's log pipe blocked the child indefinitely.
+    DEMO ONLY. Julia cannot boot on the ServerApp's worker thread, so the pooled
+    reference fit and the neural model's additivity gate run as child processes with
+    output captured (Julia's chatter into the simulation log pipe deadlocked the child).
+    Production deployments do not run any of this - the federated fit needs nothing from
+    the pooled data (theta0 and names come from the prepare round).
     """
     proc = subprocess.run(
-        [sys.executable, "-m", "nolimits_flower.task", "fit", estimator, str(ghq_level),
-         str(seed), source],
+        [sys.executable, "-m", "nolimits_flower.task", mode, model, estimator,
+         str(ghq_level), str(seed), source],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
-        raise RuntimeError(f"pooled fit failed:\n{proc.stderr[-4000:]}")
+        raise RuntimeError(f"child {mode} failed:\n{proc.stderr[-4000:]}")
     line = next(l for l in proc.stdout.splitlines() if l.startswith("POOLED_JSON "))
     return json.loads(line[len("POOLED_JSON "):])
 
@@ -135,16 +129,17 @@ def _send_all(grid: Grid, message_type: str, records: dict, label: str):
     return replies
 
 
-def agree(sites: list[tuple[int, list[str], np.ndarray]]) -> tuple[list[str], np.ndarray]:
-    """Collapse the sites' prepare replies to the one (names, theta0) they must all share.
+def agree(sites: list[tuple]) -> tuple[list[str], np.ndarray, np.ndarray]:
+    """Collapse the sites' prepare replies to the (names, theta0, log_mask) they must share.
 
     The sites run the same model, so a disagreement means they are not fitting the same
-    thing and the summed objective would be meaningless. Pure function: unit-tested.
+    thing and the summed objective would be meaningless (for the neural model this is what
+    catches an unpinned FFNN seed). Pure function: unit-tested.
     """
     if not sites:
         raise SiteFailure("prepare round: no sites reported")
-    ref_id, names, theta0 = sites[0]
-    for site_id, other_names, other_theta0 in sites[1:]:
+    ref_id, names, theta0, mask = sites[0]
+    for site_id, other_names, other_theta0, other_mask in sites[1:]:
         if other_names != names:
             raise SiteFailure(
                 f"prepare round: site {site_id} reports parameter names {other_names} but "
@@ -153,12 +148,13 @@ def agree(sites: list[tuple[int, list[str], np.ndarray]]) -> tuple[list[str], np
         if not np.array_equal(other_theta0, theta0):
             raise SiteFailure(
                 f"prepare round: site {site_id} reports theta0 {list(other_theta0)} but site "
-                f"{ref_id} reports {list(theta0)} - the sites are not running the same model"
+                f"{ref_id} reports {list(theta0)} - the sites are not running the same model "
+                "(for the neural model, an unpinned FFNN seed)"
             )
-    return list(names), np.asarray(theta0, dtype=float)
+    return list(names), np.asarray(theta0, dtype=float), np.asarray(mask, dtype=float)
 
 
-def prepare(grid: Grid, config: ConfigRecord) -> tuple[list[str], np.ndarray]:
+def prepare(grid: Grid, config: ConfigRecord) -> tuple[list[str], np.ndarray, np.ndarray]:
     """The prepare round: warm every site, log the setup table, source names/theta0.
 
     ponytail: one message per node, no retries. In the SIMULATION runtime Ray actors are
@@ -182,6 +178,7 @@ def prepare(grid: Grid, config: ConfigRecord) -> tuple[list[str], np.ndarray]:
             site_id,
             [str(n) for n in reply.content["names"]["names"]],
             reply.content["theta0"].to_numpy_ndarrays()[0],
+            reply.content["log_mask"].to_numpy_ndarrays()[0],
         ))
     return agree(sites)
 
@@ -220,23 +217,56 @@ def main(grid: Grid, context: Context) -> None:
 
 
 def _fit(grid: Grid, context: Context) -> None:
+    model = str(context.run_config["model"])
     estimator = str(context.run_config["estimator"])
     ghq_level = int(context.run_config["ghq-level"])
     seed = int(context.run_config["data-seed"])
     source = str(context.run_config["data-source"])
     max_rounds = int(context.run_config["max-rounds"])
     fail_site = int(context.run_config["fail-site"])
+    acceptance = task.spec(model).acceptance
     if fail_site >= 0:
         log(INFO, "fault injection active (testing only): site %d will raise", fail_site)
-    config = ConfigRecord({"estimator": estimator, "ghq-level": ghq_level})
+    config = ConfigRecord({"model": model, "estimator": estimator, "ghq-level": ghq_level})
 
-    # Prepare round: sites warm up and hand over the shared start point. No Julia on the
-    # server, and every later round is a pure warm evaluation.
+    # Prepare round: sites warm up and hand over the shared start point, the log mask (which
+    # coordinates are log-scaled, so the server reports natural-scale numbers without Julia)
+    # and the parameter names. No Julia on the server; every later round is a warm eval.
     t_prep = time.perf_counter()
-    names, x0 = prepare(grid, config)
+    names, x0, mask = prepare(grid, config)
     log(INFO, "prepare round wall=%.1fs", time.perf_counter() - t_prep)
-    log(INFO, "estimator=%s data-source=%s data-seed=%d params=%s start(natural)=%s",
-        estimator, source, seed, names, task.to_natural(x0, names))
+
+    # Neural model: the additivity of the site (value, gradient) IS the acceptance gate (the
+    # headline exact-FL property), checked at theta0 by a self-contained child probe.
+    if acceptance == "nn":
+        log(INFO, "NN additivity gate: sum over sites vs pooled-data call at theta0")
+        probe = _child("probe", model, estimator, ghq_level, seed, source)["probes"]["laplace"]
+        log(INFO, "  value_rel=%.3e gradient_rel=%.3e", probe["value_rel"], probe["gradient_rel"])
+        if probe["value_rel"] >= 1e-8 or probe["gradient_rel"] >= 1e-8:
+            raise RuntimeError(
+                f"NN additivity gate failed: value_rel={probe['value_rel']:.3e} "
+                f"gradient_rel={probe['gradient_rel']:.3e} (tol 1e-8) - the summed site "
+                "contributions are not the pooled-data value/gradient"
+            )
+        log(INFO, "PASS: NN site contributions are additive (value %.1e, gradient %.1e)",
+            probe["value_rel"], probe["gradient_rel"])
+
+    log(INFO, "model=%s estimator=%s data-source=%s params=%d start(natural[:5])=%s",
+        model, estimator, source, len(names), task.to_natural(x0, mask)[:5])
+
+    # DEMO ONLY: the pooled fit_model reference. For the PK/growth models it is the
+    # acceptance comparison run AFTER convergence. For the neural model, whose ~86 weights
+    # are non-identifiable (permutation/sign symmetries), the federated fit is warm-started
+    # from the pooled optimum so the objective comparison is meaningful; a real deployment
+    # has no pooled dataset and would warm-start from a federated naive-pooled pass instead
+    # (naive-pooled is itself a per-subject sum, so it federates). Production deletes this.
+    ref = None
+    if acceptance == "nn":
+        ref = _child("fit", model, estimator, ghq_level, seed, source)
+        if ref["names"] != names:
+            raise RuntimeError(f"pooled reference order {ref['names']} != sites' {names}")
+        x0 = np.asarray(ref["theta_transformed"], dtype=float)  # warm start (demo-only)
+        log(INFO, "NN federated fit warm-started from the pooled optimum (demo-only)")
 
     rounds = 0
     max_round_wall = 0.0
@@ -245,8 +275,7 @@ def _fit(grid: Grid, context: Context) -> None:
     # Preconditioning, NoLimits' own rule (see task.precondition_scale): optimize z with
     # theta = x0 + s * z, so grad_z = s * grad_theta. Raw transformed coordinates mix a
     # volume of ~8 with unit-size log-parameters, which costs L-BFGS-B extra evaluations.
-    s = task.precondition_scale(x0, names)
-    log(INFO, "preconditioning scale = %s", dict(zip(names, s.tolist())))
+    s = task.precondition_scale(x0, mask)
 
     def federated(z: np.ndarray):
         nonlocal rounds, max_round_wall
@@ -277,28 +306,40 @@ def _fit(grid: Grid, context: Context) -> None:
     final = broadcast(grid, theta_star, config, rnd=rounds + 1)
     rounds += 1
     fed_value = sum(v for _, v, _ in final)
-    fed_natural = task.to_natural(theta_star, names)
+    fed_natural = task.to_natural(theta_star, mask)
 
     log(INFO, "converged=%s (%s)", res.success, res.message)
-    log(INFO, "federated theta*(natural) = %s", dict(zip(names, fed_natural.tolist())))
     log(INFO, "federated loglik=%.10f evaluation rounds=%d wall=%.1fs (%.2fs/round, "
         "slowest round %.2fs)", fed_value, rounds, wall, wall / max(rounds, 1),
         max_round_wall)
     for site_id, value, _ in sorted(final):
         log(INFO, "  site %d contribution: %.10f", site_id, value)
 
-    # DEMO ONLY, and only now that the fit is done: the pooled reference the acceptance
-    # table compares against. Production deployments delete this call.
-    ref = pooled_fit(estimator, ghq_level, seed, source)
-    if ref["names"] != names:
-        raise RuntimeError(f"pooled reference parameter order {ref['names']} != sites' {names}")
+    # DEMO ONLY: the pooled reference the acceptance compares against (already fetched for
+    # the neural model's warm start). Production deployments delete this call.
+    if ref is None:
+        ref = _child("fit", model, estimator, ghq_level, seed, source)
+        if ref["names"] != names:
+            raise RuntimeError(f"pooled reference order {ref['names']} != sites' {names}")
     pooled_natural = np.asarray(ref["theta_natural"], dtype=float)
     pooled_value = float(ref["value"])
     value_rel = abs(fed_value - pooled_value) / abs(pooled_value)
     theta_rel = np.abs(fed_natural - pooled_natural) / np.abs(pooled_natural)
 
-    log(INFO, "ACCEPTANCE (federated vs pooled fit_model, data-source=%s data-seed=%d)",
-        source, seed)
+    # Neural model: ~86 weights are non-identifiable (permutation/sign symmetries), so valid
+    # fits agree in objective/predictions while differing in weights. The additivity gate
+    # above is the acceptance; here we only REPORT the objective agreement.
+    if acceptance == "nn":
+        log(INFO, "NN objective agreement (federated fit vs pooled fit_model): "
+            "federated=%.8f pooled=%.8f rel.diff=%.3e", fed_value, pooled_value, value_rel)
+        log(INFO, "PASS: NN federation is exact (additivity gated); objective agreement "
+            "%.3e reported, parameter-wise agreement not claimed (weights non-identifiable)",
+            value_rel)
+        return
+
+    log(INFO, "federated theta*(natural) = %s", dict(zip(names, fed_natural.tolist())))
+    log(INFO, "ACCEPTANCE (federated vs pooled fit_model, model=%s data-source=%s)",
+        model, source)
     log(INFO, "  %-8s %14s %14s %10s", "param", "federated", "pooled", "rel.diff")
     for name, f, p, r in zip(names, fed_natural, pooled_natural, theta_rel):
         log(INFO, "  %-8s %14.8f %14.8f %10.2e", name, f, p, r)
@@ -326,7 +367,9 @@ def _fit(grid: Grid, context: Context) -> None:
             "%.8f); parameter-wise agreement is not claimed for GHQ, see the README",
             fed_value, pooled_value)
         return
-    theta_tol = PARAM_TOL[estimator]
+    # pooled's plug-in eta makes the objective nearly flat in the omegas (1e-2); otherwise
+    # the strict model tolerance (1e-3 for the PK and growth models).
+    theta_tol = 1.0e-2 if estimator == "pooled" else task.spec(model).param_tol
     if value_rel >= 1e-6 or theta_rel.max() >= theta_tol:
         raise RuntimeError(
             f"acceptance failed: objective rel {value_rel:.3e} (tol 1e-6), "

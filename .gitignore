@@ -6,6 +6,5 @@ __pycache__/
 *.png
 .DS_Store
 PLAN.md
-data/
 .flwr-local/
 *.fab
