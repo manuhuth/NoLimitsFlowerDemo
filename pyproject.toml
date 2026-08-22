@@ -34,6 +34,7 @@ serverapp = "nolimits_flower.server_app:app"
 clientapp = "nolimits_flower.client_app:app"
 
 [tool.flwr.app.config]
+model = "warfarin"  # warfarin | theophylline | warfarin-nn | orange (see README Models)
 estimator = "laplace"
 ghq-level = 3  # NoLimits' own default; levels 1-3 are its numerically stable range
 data-source = "warfarin"  # or "simulated" for the seeded synthetic demo
@@ -42,4 +43,7 @@ max-rounds = 100
 fail-site = -1  # testing only: make this site id raise in its handler
 
 [tool.pytest.ini_options]
-markers = ["slow: boots one Julia per simulated site and fits (minutes)"]
+markers = [
+    "slow: boots one Julia per site and fits (minutes)",
+    "veryslow: the neural model (87 params, extra child boots); CI can skip it",
+]

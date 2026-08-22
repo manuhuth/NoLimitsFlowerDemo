@@ -61,13 +61,14 @@ jobs:
         env:
           PYTHON_JULIAPKG_PROJECT: ${{ github.workspace }}/julia_env
           PYTHON_JULIAPKG_OFFLINE: "yes"
-        run: python -c "from nolimits_flower import task; print(task.warfarin().shape)"
+        run: python -c "from nolimits_flower import task; print(task.dataset('warfarin').shape)"
 
       - name: Fast tests
-        run: pytest tests -m "not slow" -q
+        run: pytest tests -m "not slow and not veryslow" -q
 
-      # One Julia per simulated site plus the pooled reference fit: minutes, not seconds.
-      - name: Slow equivalence test
+      # Additivity (all four models) + PK/growth federated fits + fault injection. The
+      # neural model is `veryslow` and excluded here; run it on demand with `-m veryslow`.
+      - name: Slow equivalence tests
         timeout-minutes: 45
         env:
           PYTHON_JULIAPKG_PROJECT: ${{ github.workspace }}/julia_env

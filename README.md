@@ -21,17 +21,73 @@ observations from 30 subjects**, mapped to the model's columns as `ID=id`, `t`, 
 (the per-subject dose, 60 to 153 mg) and `conc=C`. Subjects are split into 3 contiguous
 sites of 10.
 
-The first run downloads the file and caches the raw frame at `data/warfarin.csv`
-(gitignored); every later run and every test reads the cache, so repeat runs are offline.
+The demo bundles small **real public** datasets so it is self-contained and offline: the
+raw warfarin frame is committed at `data/warfarin.csv` (downloaded once through NoLimits'
+loader if missing), the Theoph data at `data/theoph.csv` (R's `datasets::Theoph`, vendored
+from the NoLimitsPy examples), and the Orange data at `data/orange.csv` (exported from R's
+`datasets::Orange`). No network is needed after checkout.
 
-The seeded synthetic data set is still there behind `data-source="simulated"`: 24 subjects
-at TRUE_THETA, split 8/8/8. It powers the fast tests and the fault-injection test, and it
-is the only mode with a known true theta, so it is where the additivity of the site
-quantities is checked.
+The seeded synthetic data set is still there behind `data-source="simulated"` (warfarin
+only): 24 subjects at TRUE_THETA, split 8/8/8. It powers the fast tests and the
+fault-injection test, and it is the only mode with a known true theta.
 
-## The model
+## Models
 
-The model is a warfarin population PK model: single oral dose, one compartment with
+A single run-config knob, `model`, selects one of four models. All four federate through
+the same primitive - a per-subject sum, so the summed site contributions ARE the pooled
+value and gradient exactly (**additivity**, checked to 1e-8 for every model). What differs
+is the acceptance each model can support. The spread is deliberate: two classical PK
+models, one **neural** mixed-effects model, and one **growth curve** - and the classical
+warfarin PK model against a neural network on the *identical* warfarin data.
+
+| `model` | data (all real) | kind | parameters | sites | acceptance |
+|---|---|---|---|---|---|
+| `warfarin` (default) | Monolix warfarin, 30 subj / 227 obs | 1-cmt oral PK, closed-form ODE | 7 | 3 × 10 | strict: objective 1e-6, params 1e-3 |
+| `theophylline` | R `Theoph`, 12 subj / 132 obs | 1-cmt oral PK, closed-form ODE | 7 | 3 × 4 | strict: objective 1e-6, params 1e-3 |
+| `warfarin-nn` | same warfarin frame | **neural** mixed effects (FFNN mean) | 87 | 3 × 10 | **additivity gate** (1e-8) + reported objective agreement |
+| `orange` | R `Orange`, 5 trees / 35 obs | logistic **growth** curve, algebraic | 5 | 2/2/1 | strict: objective 1e-6, params 1e-3 |
+
+**warfarin / theophylline** are the same 1-compartment oral-absorption family (depot →
+central, log-normal REs on `ka`, `cl`, `v`); the ODE is linear so NoLimits uses its
+closed-form fast path. Both are fully identifiable, so the federated fit must match the
+pooled `fit_model` on both objective and every natural-scale parameter.
+
+**warfarin-nn** replaces the PK structure with a feed-forward network: the mean
+concentration is `NN([d, t, eta], nn_params)` where `nn_params` is an `FFNNParameters`
+block (a `(3, 5, 5, 5, 1)` tanh MLP, 86 weights) and `eta` is a per-subject random effect.
+Its acceptance is different by necessity. The ~86 network weights are **non-identifiable**:
+permutation and sign symmetries of the hidden units mean many distinct weight vectors give
+the same predictions and the same likelihood, so two valid fits agree in objective and
+predictions while differing in weights. Comparing parameters would be meaningless.
+Federation is instead gated on the property federation is actually responsible for -
+**additivity**: the sum over sites of `(value, gradient)` equals the pooled-data call at
+theta0 to 1e-8 (this is exact, the headline claim for the neural model). The full federated
+fit's objective is then compared to the pooled `fit_model` objective and *reported*, not
+gated on parameters.
+
+Two seeds matter for the neural model. The `FFNNParameters` **`seed` is pinned in the model
+string** (`seed=1234`), so every site's Glorot-uniform weight initialization is identical;
+without it theta0 would differ across sites and the prepare-round agreement check would
+abort the run (which is the correct behaviour - unpinned, the sites are not fitting the same
+model). The pooled reference fit uses the user's verified recipe (`Random.seed!(1234)`,
+`Laplace()`, `pooled_init=true`). Because the weights are non-identifiable, the federated
+fit is **warm-started from the pooled optimum** so the objective comparison is on the same
+basin. That warm-start is **demo-only**: a real deployment has no pooled dataset and would
+warm-start from a federated naive-pooled pass instead (naive-pooled is itself a per-subject
+sum, so it federates the same way).
+
+**orange** is the classic nlme Orange dataset - trunk circumference of 5 orange trees
+against age - fit with a logistic growth curve `(Asym + eta) / (1 + exp((xmid - age) /
+scal))` and a per-tree random effect on the asymptote. It is non-PK, non-ODE and fully
+algebraic (the covariate `age` is referenced by name; the reserved-`t` gotcha only applies
+to differential-equation state access). It shows the federation math is not tied to PK or
+to ODEs. With only 5 trees the RE-variance estimate `omega` is uncertain, but additivity is
+exact regardless of sample size and the fit still matches the pooled `fit_model` within the
+strict tolerance (see *Equivalence, measured*).
+
+## The warfarin model (baseline)
+
+The default `model="warfarin"` is a warfarin population PK model: single oral dose, one compartment with
 first-order absorption, and multiplicative log-normal random effects on absorption rate,
 clearance and volume (`ka` 1/h, `cl` L/h, `v` L, concentrations mg/L).
 
@@ -330,7 +386,8 @@ Run-config knobs (`--run-config 'key=value ...'`):
 
 | key | default | meaning |
 |---|---|---|
-| `estimator` | `"laplace"` | `laplace`, `focei`, `ghq` (Gauss-Hermite quadrature) or `pooled` (naive-pooled plug-in); see *Estimators* |
+| `model` | `"warfarin"` | `warfarin`, `theophylline`, `warfarin-nn` (neural) or `orange` (growth); see *Models* |
+| `estimator` | `"laplace"` | `laplace`, `focei`, `ghq` (Gauss-Hermite quadrature) or `pooled` (naive-pooled plug-in); see *Estimators*. The non-warfarin models default to and are documented for `laplace` |
 | `ghq-level` | 3 | quadrature level when `estimator="ghq"`; 1 to 3 is NoLimits' numerically stable range |
 | `data-source` | `"warfarin"` | the real warfarin PK data, or `"simulated"` for the seeded synthetic set |
 | `data-seed` | 20260818 | which simulated data set; ignored when `data-source="warfarin"` |
@@ -341,9 +398,11 @@ Note the embedded quotes: `--run-config` values are TOML, so a string needs its 
 inside the shell quotes.
 
 ```bash
+flwr run . --stream --run-config 'model="theophylline"' --federation-config ...
+flwr run . --stream --run-config 'model="orange"' --federation-config ...
+flwr run . --stream --run-config 'model="warfarin-nn" max-rounds=40' --federation-config ...
 flwr run . --stream --run-config 'estimator="focei"' --federation-config ...
 flwr run . --stream --run-config 'estimator="ghq" ghq-level=3 max-rounds=200' --federation-config ...
-flwr run . --stream --run-config 'estimator="pooled"' --federation-config ...
 ```
 
 The estimator-agnostic additivity check needs no federation and boots Julia once for all
@@ -360,8 +419,9 @@ server_app.py   ServerApp: prepare round, then L-BFGS-B over the summed site
                 (value, gradient); demo-only pooled comparison after convergence
 client_app.py   ClientApp: one site; Julia warmed at import; `query.prepare` builds and
                 warms the DataModel, `query` answers theta with aggregates
-task.py         model string, simulation, partitioning, theta glue, pooled reference
-                (no Flower imports, so it is unit-testable without a federation)
+task.py         the 4-model CATALOG (model string, real-data loader + column map,
+                estimator, site count, acceptance kind), partitioning, theta glue,
+                pooled reference + additivity probe (no Flower imports, unit-testable)
 ```
 
 The server side of the fit is Julia-free: names and the start theta come from the prepare
@@ -420,20 +480,31 @@ it at its `-1` default.
 ## Tests
 
 ```bash
-pytest tests -m "not slow" -q     # fast: partitioning, theta scales, config, error parsing
-pytest tests -m slow -q -s        # additivity of all four estimators, the laplace
-                                  # federated fit, and the fault-injection abort
+pytest tests -m "not slow and not veryslow" -q   # fast: catalog, column maps, theta scales, config
+pytest tests -m slow -q -s                        # additivity (all 4 models) + PK/growth fits + abort
+pytest tests -m veryslow -q -s                    # the neural model (heaviest)
 ```
 
-The fast tests need neither Julia nor a federation and run in 0.4 s (24 tests: partitioning,
-theta scales, estimator-name validation, prepare-round agreement, error parsing). The three
-slow tests took 957 s together on a laptop (360 s laplace equivalence, 346 s the four-estimator
-additivity probe, 251 s the fault injection), dominated by Julia boot and model compilation -
-the federated loops themselves are seconds. The additivity probe is the one slow test that
-needs no federation: one Julia boot, all four estimators. The per-estimator *fit* acceptance
-runs (the table above) stay a report-level verification; CI keeps only the laplace
-equivalence run. `.github/workflows/ci.yml` runs the fast tests on every push and the slow
-suite with a 45 minute ceiling.
+The fast tests (36) need neither Julia nor a federation and run in ~1 s: the 4-model
+catalog selection, per-model column maps, unknown-model rejection, the FFNN-seed pin,
+partitioning per primary id, the log-mask theta scaling, prepare-round agreement and error
+parsing.
+
+The slow tests are dominated by Julia boot and model compilation, not the federated loops:
+
+- **Additivity** is parametrized over all four models (`test_site_contributions_add_up`):
+  the sum over sites of `(value, gradient)` equals the pooled-data call to 1e-8 - for every
+  estimator on the PK and growth models, and for `laplace` on the neural model. One Julia
+  boot per model, no federation.
+- **PK + growth fits** (`warfarin`, `theophylline`, `orange`) run the full federated fit and
+  assert the ServerApp reached its strict acceptance (objective 1e-6, parameters 1e-3).
+- The **neural model** is marked `veryslow` and round-capped (`max-rounds=40`): it runs a
+  child additivity probe (the gate), a child pooled fit, and the warm-started federated fit.
+  It asserts the additivity gate passed and the objective-agreement line was reported.
+- **Fault injection** asserts a raising site aborts the whole fit.
+
+`.github/workflows/ci.yml` runs the fast tests on every push and a subset of the slow suite;
+the `veryslow` neural case can be skipped in CI and run on demand.
 
 ## Deployment outlook
 
