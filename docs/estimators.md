@@ -69,8 +69,9 @@ good approximation and you want the pharmacometrics-standard estimator.
 ## `ghq` — Gauss-Hermite quadrature
 
 ```bash
-# GHQ needs more rounds than the others, so raise max-rounds
-flwr run . --stream --run-config 'estimator="ghq" ghq-level=3 max-rounds=200' \
+# The federated GHQ *fit* is optimizer-fragile above level 1 on this small data (caveat
+# below); ghq-level=1 is the level that reliably passes the one-sided gate here.
+flwr run . --stream --run-config 'estimator="ghq" ghq-level=1 max-rounds=200' \
   --federation-config "num-supernodes=3 client-resources-num-cpus=3 init-args-num-cpus=3"
 ```
 
@@ -79,23 +80,29 @@ a Gauss-Hermite grid, rather than approximating it at the mode. Higher `ghq-leve
 quadrature nodes.
 
 !!! warning "The `ghq-level` local-optima caveat — honest"
-    The quadrature objective is **rough** on this model. NoLimits itself warns that levels
-    above 3 can cancel in the signed logsumexp, and it falls back to the level-1 rule for a
-    batch when the prior-centred rule goes unstable. Because of that roughness, scipy's
-    L-BFGS-B and `fit_model`'s Optim LBFGS **settle in different local optima**, and neither
-    side wins consistently — measured against the pooled reference, the federated optimum is
-    `5.6e-02` **better** at level 3 and `6.7e-02` worse at level 5.
+    The quadrature objective is **rough** on this model, and the federated GHQ *fit* is
+    fragile above level 1 on the warfarin data (measured, current scipy L-BFGS-B):
 
-    A parameter-wise gate is therefore unreachable in either direction. So the run gates on
-    what federation is actually responsible for: the summed objective **is** the pooled
-    objective (additivity `2.3e-16`), and optimizing it loses nothing — i.e. the federated
-    optimum is **no worse** than the pooled one (a one-sided gate). The default `ghq-level`
-    is **3**, NoLimits' own default and its documented numerically stable range (1–3); level
-    5 is reported but not gated. GHQ also needs more rounds (127 at level 3 vs 34 for FOCEI),
-    so **raise `max-rounds` above its default of 100** for it.
+    - **level 1** completes cleanly and passes the one-sided gate — the federated optimum
+      equals the pooled `fit_model` optimum to `1e-8` (about 23 rounds).
+    - **level 2** completes, but the federated L-BFGS-B and `fit_model`'s Optim LBFGS
+      **settle in different local optima** and the federated one lands `6.1e-03` *worse* than
+      pooled, so the one-sided gate **fails**.
+    - **level 3** (the `[tool.flwr.app.config]` default) can drive L-BFGS-B's line search
+      into a `theta` where a site's marginal is **non-finite**; the demo's fault policy — a
+      non-finite site contribution aborts the fit (see [Architecture](architecture.md)) —
+      then **aborts the run** mid-optimization.
+
+    None of this is a federation error: the summed objective **is** the pooled objective
+    exactly (additivity `2.3e-16`, verified by the probe). It is an optimizer-path problem —
+    two different optimizers on the same non-convex, rough surface — which is why the run can
+    only ever apply a **one-sided** gate ("no worse than pooled") and why, on this demo's
+    small sites, only `ghq-level=1` currently satisfies it. NoLimits' own default is level 3,
+    but for a robust federated fit on this demo prefer `laplace` or `focei`.
 
 **Reach for it** when you want a quadrature-based marginal likelihood rather than a
-mode-based one, and you accept the one-sided acceptance on rough objectives.
+mode-based one, and are prepared to tune `ghq-level` per data set; on this demo only level 1
+passes the one-sided gate.
 
 ## `pooled` — naive-pooled plug-in
 
@@ -124,7 +131,7 @@ likelihood rather than integrating the random effect out.
 
 Its acceptance uses a looser `1e-2` parameter tolerance: the plug-in `eta` depends on `omega`
 only through `exp(omega²/2)`, so the objective is nearly flat in the omegas. The two fits
-agree to `3.1e-10` in the objective while `omega_cl` differs by `6.2e-03` — a plateau, not a
+agree to `1.8e-10` in the objective while `omega_cl` differs by `2.8e-03` — a plateau, not a
 federation error.
 
 **Reach for it** when a fast plug-in fit is enough and every random effect resolves to a

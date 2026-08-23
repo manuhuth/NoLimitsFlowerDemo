@@ -201,7 +201,7 @@ gradient it reports is `s * grad_theta`). The scale s follows NoLimits' own rule
 in `task.precondition_scale` from `_precondition_scale` / `_precondition_maps` in
 NoLimits.jl `src/estimation/common.jl`: `s_i = max(|theta0_i|, 1)` for a coordinate on the
 identity scale, 1 for a log-scaled one. Here only `v` (about 8 L) differs from 1, and that
-one number is worth 85 rounds down to 29 - the raw scale also made L-BFGS-B exit with the
+one number is worth 85 rounds down to 36 - the raw scale also made L-BFGS-B exit with the
 cosmetic `ABNORMAL` flag, the preconditioned one converges cleanly.
 
 Theta crosses the wire on the transformed (unconstrained) scale, so positivity constraints
@@ -241,26 +241,26 @@ Two of the four need a caveat, and both caveats are about the *optimizer*, not t
   draws) if it is not ForwardDiff-safe there. In this model every random effect is
   `LogNormal`, whose mean is finite and smooth, so every site resolves to `:mean` and the
   plug-in eta is `exp(omega^2/2)`, a function of **theta alone** - identical on every site,
-  hence exact additivity (1.1e-16). A model where the resolution depends on the data (a
+  hence exact additivity (2.4e-16). A model where the resolution depends on the data (a
   normalizing-flow random effect, or a strategy demoted on one site's data only) would
   calibrate per site and the federated objective would stop being the pooled-data objective.
   Re-run the probe after changing the model; the slow test does exactly that.
   Its acceptance also uses a looser 1e-2 parameter tolerance: the plug-in eta depends on
   omega only through `exp(omega^2/2)`, so the objective is nearly flat in the omegas. The two
-  fits agree to 3.1e-10 in the objective while `omega_cl` differs by 6.2e-03 - a plateau, not
+  fits agree to 1.8e-10 in the objective while `omega_cl` differs by 2.8e-03 - a plateau, not
   a federation error.
-- **`ghq` gets a one-sided gate.** The quadrature objective is rough on this model: NoLimits
-  warns that levels above 3 can cancel in the signed logsumexp, and it falls back to the
-  level-1 rule for a batch when the prior-centred rule goes unstable. scipy's L-BFGS-B and
-  `fit_model`'s Optim LBFGS therefore settle in *different* local optima, and neither side
-  wins consistently - measured against the pooled `fit_model` reference, the federated
-  optimum is 5.6e-02 **better** at level 3 and 6.7e-02 worse at level 5. A parameter-wise
-  gate is unreachable in either direction, so the run asserts what federation is actually
-  responsible for: the summed objective is the pooled objective (2.3e-16), and optimizing it
-  loses nothing, i.e. the federated optimum is no worse than the pooled one. The default
-  `ghq-level` is therefore 3, NoLimits' own default and its documented stable range; level 5
-  is reported but not gated. GHQ also needs more rounds than the others (127 at level 3
-  against 34 for FOCEI), so raise `max-rounds` above its default 100 for it.
+- **`ghq` gets a one-sided gate, and its fit is optimizer-fragile above level 1.** The
+  quadrature objective is rough on this model, so scipy's L-BFGS-B and `fit_model`'s Optim
+  LBFGS settle in *different* local optima and a parameter-wise gate is unreachable; the run
+  therefore asserts only what federation is responsible for - the summed objective is the
+  pooled objective (additivity 2.3e-16, verified by the probe) and the federated optimum is
+  *no worse* than the pooled one. On this demo's small warfarin sites (current scipy) only
+  `ghq-level=1` actually satisfies that gate: level 1 completes and the federated optimum
+  equals the pooled fit to 1e-8 (~23 rounds); level 2 completes but lands 6.1e-03 *worse*
+  than pooled, failing the gate; level 3 (the config default) can drive the line search into
+  a `theta` where a site's marginal is non-finite, which the demo's fault policy turns into a
+  mid-fit abort. None of this is a federation error - it is two optimizers on one non-convex
+  surface - but for a robust federated fit prefer `laplace` or `focei`.
 
 SAEM and MCEM are not federated; they need a per-site E-step sufficient-statistics primitive
 upstream in NoLimits. `MLE` and `MAP` have the protocol too but require a model without
@@ -378,7 +378,7 @@ flwr run . --stream --run-config 'model="theophylline"' --federation-config ...
 flwr run . --stream --run-config 'model="orange"' --federation-config ...
 flwr run . --stream --run-config 'model="warfarin-nn" max-rounds=40' --federation-config ...
 flwr run . --stream --run-config 'estimator="focei"' --federation-config ...
-flwr run . --stream --run-config 'estimator="ghq" ghq-level=3 max-rounds=200' --federation-config ...
+flwr run . --stream --run-config 'estimator="ghq" ghq-level=1 max-rounds=200' --federation-config ...
 ```
 
 The estimator-agnostic additivity check needs no federation and boots Julia once for all
@@ -461,7 +461,7 @@ pytest tests -m slow -q -s                        # additivity (all 4 models) + 
 pytest tests -m veryslow -q -s                    # the neural model (heaviest)
 ```
 
-The fast tests (36) need neither Julia nor a federation and run in ~1 s: the 4-model
+The fast tests (57) need neither Julia nor a federation and run in ~1 s: the 4-model
 catalog selection, per-model column maps, unknown-model rejection, the FFNN-seed pin,
 partitioning per primary id, the log-mask theta scaling, prepare-round agreement and error
 parsing.

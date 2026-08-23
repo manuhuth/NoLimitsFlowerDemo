@@ -141,7 +141,7 @@ reported — no per-site contribution, no objective trajectory, and no objective
     "enabled": true,
     "adjacency": "add/remove one subject",
     "unit": "subject",
-    "epsilon": 167.86,
+    "epsilon": 143.46,
     "delta": 1e-05,
     "releases": 41,
     "sites": 3,
@@ -149,7 +149,7 @@ reported — no per-site contribution, no objective trajectory, and no objective
     "noise": "distributed: each site adds N(0, (sigma*clip)^2 / sites)",
     "noise-multiplier": 0.5,
     "rounds": 40,
-    "epsilon-per-site-vs-server": 106.6
+    "epsilon-per-site-vs-server": 352.45
   }
 }
 ```

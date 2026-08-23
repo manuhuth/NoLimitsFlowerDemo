@@ -74,7 +74,7 @@ bookkeeping.
 
 **Why it matters:** the raw transformed coordinates mix a volume of ~8 (for `v`) with
 unit-size log-parameters, which costs L-BFGS-B extra evaluations. On the warfarin model that
-one number is worth **85 rounds down to 29**, and the raw scale also made L-BFGS-B exit with
+one number is worth **85 rounds down to 36**, and the raw scale also made L-BFGS-B exit with
 the cosmetic `ABNORMAL` flag while the preconditioned one converges cleanly (`CONVERGENCE:
 RELATIVE REDUCTION OF F <= FACTR*EPSMCH`). The exit flag is reported but nothing is gated on
 it — the acceptance table is.
