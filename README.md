@@ -312,44 +312,58 @@ exit flag is reported but nothing is gated on it - the acceptance table is.
 
 ## Quickstart
 
-Prerequisites: Python 3.11 or newer, Julia 1.11 (the version juliapkg selects), and git.
+Follow these steps in order. Every step after step 2 runs **from the repository root**
+(`NoLimitsFlowerDemo/`, the directory that contains `pyproject.toml`).
+
+**Step 0 - prerequisites.** You need only **Python 3.11 or newer** and **git**. You do
+**not** install Julia by hand: on the first run, `juliapkg` automatically downloads Julia
+and NoLimits 0.2.6 from the registry. That first run therefore downloads and precompiles
+for **several minutes** - this is normal, it has not hung. Later runs start in seconds.
+
+**Step 1 - clone the repository.**
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -e . "git+https://github.com/manuhuth/NoLimitsPy"
+git clone https://github.com/manuhuth/NoLimitsFlowerDemo
 ```
 
-NoLimits' federation primitives (`objective_and_gradient`, `build_fit_context`) shipped in
-**NoLimits v0.2.6**, so the shared Julia project (`julia_env/`, gitignored) now tracks the
-registered release instead of `main`. Pinning it keeps every entry point on one env:
+**Step 2 - enter the repository root.** Every command below is run from here.
 
 ```bash
-julia +1.11 -e 'import Pkg; Pkg.activate("julia_env");
-                Pkg.add([Pkg.PackageSpec(name="NoLimits", version="0.2.6"),
-                         Pkg.PackageSpec(name="PythonCall")])'
+cd NoLimitsFlowerDemo
 ```
 
-Use the same Julia minor version juliapkg selects for NoLimitsPy (`julia +1.11`); mixing
-minor versions invalidates the precompile cache. Refresh with `Pkg.update()`. Run Python
-entry points outside Flower with:
+**Step 3 - create a virtual environment.**
 
 ```bash
-export PYTHON_JULIAPKG_PROJECT="$PWD/julia_env"
-export PYTHON_JULIAPKG_OFFLINE=yes
+python -m venv .venv
 ```
 
-Drop both variables and `julia_env/` entirely if you do not need the pinned env: juliapkg
-then resolves NoLimits >= 0.2.5 from the registry by itself, which is what the deployable
-counterpart of this demo does. All datasets are committed CSVs read with pandas, so no
-Julia-side data download or `CSV` weak dependency is involved.
+**Step 4 - activate it.**
 
-Run the demo. Each site boots its own Julia (0.5 to 2 GB resident, one model compilation),
-so cap the simulation concurrency:
+```bash
+source .venv/bin/activate
+# Windows (PowerShell): .venv\Scripts\activate
+```
+
+**Step 5 - install the app.** This single command installs the app, NoLimitsPy (pulled
+automatically as a dependency), and everything else it needs.
+
+```bash
+pip install -e .
+```
+
+**Step 6 - run the demo.** The first run provisions Julia and NoLimits (several minutes),
+then prints the federated-vs-pooled equivalence result. Each site boots its own Julia
+(0.5 to 2 GB resident, one model compilation), so cap the simulation concurrency:
 
 ```bash
 flwr run . --stream --federation-config \
   "num-supernodes=3 client-resources-num-cpus=3 init-args-num-cpus=3"
 ```
+
+**Troubleshooting.** If you see `does not appear to be a Python project` (or
+`Neither 'setup.py' nor 'pyproject.toml' found`), you are not in the repository root. Run
+`cd` into the cloned `NoLimitsFlowerDemo` directory and retry from there.
 
 Equal `client-resources-num-cpus` and `init-args-num-cpus` size the Ray actor pool to one
 actor, which serves all three sites: one Julia, one model compilation, and no site build
@@ -359,6 +373,19 @@ re-warm rounds mid-fit. The run logs the prepare
 table, every round, the federated theta*, the per-site contributions, the acceptance
 table above and a final `PASS:` line. It federates the real warfarin data by default, read
 from the committed `data/warfarin.csv` (nlmixr2data, GPL-3); no download is needed.
+
+Optional - pin a shared Julia project. By default juliapkg resolves NoLimits >= 0.2.6 from
+the registry, which is all the steps above need. To instead share one pinned env across
+every entry point (`julia_env/`, gitignored), create it with the Julia minor version
+juliapkg selects (mixing minors invalidates the precompile cache) and point Python at it:
+
+```bash
+julia +1.11 -e 'import Pkg; Pkg.activate("julia_env");
+                Pkg.add([Pkg.PackageSpec(name="NoLimits", version="0.2.6"),
+                         Pkg.PackageSpec(name="PythonCall")])'
+export PYTHON_JULIAPKG_PROJECT="$PWD/julia_env"
+export PYTHON_JULIAPKG_OFFLINE=yes
+```
 
 Run-config knobs (`--run-config 'key=value ...'`):
 

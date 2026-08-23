@@ -10,6 +10,10 @@ license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = [
     "flwr[simulation]>=1.33.0",
+    # NoLimitsPy is not on PyPI, so it installs as a PEP 508 direct-URL dependency:
+    # `pip install -e .` alone pulls it. (Valid because this app is GitHub-installed, not
+    # published to PyPI, which forbids direct-URL deps.)
+    "NoLimitsPy @ git+https://github.com/manuhuth/NoLimitsPy",
     "numpy",
     "pandas",
     "scipy",

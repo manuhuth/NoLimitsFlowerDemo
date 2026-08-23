@@ -48,28 +48,51 @@ The neural result is the striking one: a feed-forward network embedded as the me
 of a mixed-effects model federates **exactly**, the summed site `(value, gradient)` equalling
 the pooled-data call to `1e-8`. See [Models](models.md) and [Estimators](estimators.md).
 
-## Quickstart
+## Installation
 
-Prerequisites: Python 3.11+, Julia 1.11 (the version juliapkg selects), git.
+Follow these steps in order. Every step after step 2 runs **from the repository root**
+(`NoLimitsFlowerDemo/`, the directory that contains `pyproject.toml`).
+
+**Step 0 - prerequisites.** You need only **Python 3.11 or newer** and **git**. You do
+**not** install Julia by hand: on the first run `juliapkg` automatically downloads Julia
+and NoLimits 0.2.6 from the registry. That first run therefore downloads and precompiles
+for **several minutes** - this is normal, it has not hung. Later runs start in seconds.
+
+**Step 1 - clone the repository.**
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -e . "git+https://github.com/manuhuth/NoLimitsPy"
+git clone https://github.com/manuhuth/NoLimitsFlowerDemo
 ```
 
-NoLimits' federation primitives (`objective_and_gradient`, `build_fit_context`) shipped in
-**NoLimits v0.2.6**. The demo pins a shared Julia project (`julia_env/`, gitignored):
+**Step 2 - enter the repository root.** Every command below is run from here.
 
 ```bash
-julia +1.11 -e 'import Pkg; Pkg.activate("julia_env");
-                Pkg.add([Pkg.PackageSpec(name="NoLimits", version="0.2.6"),
-                         Pkg.PackageSpec(name="PythonCall")])'
-export PYTHON_JULIAPKG_PROJECT="$PWD/julia_env"
-export PYTHON_JULIAPKG_OFFLINE=yes
+cd NoLimitsFlowerDemo
 ```
 
-Run the default demo (real warfarin PK data, Laplace estimator). Each site boots its own
-Julia, so cap the simulation concurrency:
+**Step 3 - create a virtual environment.**
+
+```bash
+python -m venv .venv
+```
+
+**Step 4 - activate it.**
+
+```bash
+source .venv/bin/activate
+# Windows (PowerShell): .venv\Scripts\activate
+```
+
+**Step 5 - install the app.** This single command installs the app, NoLimitsPy (pulled
+automatically as a dependency), and everything else it needs.
+
+```bash
+pip install -e .
+```
+
+**Step 6 - run the demo** (real warfarin PK data, Laplace estimator). The first run
+provisions Julia and NoLimits (several minutes), then prints the equivalence result. Each
+site boots its own Julia, so cap the simulation concurrency:
 
 ```bash
 flwr run . --stream --federation-config \
@@ -79,6 +102,23 @@ flwr run . --stream --federation-config \
 Equal `client-resources-num-cpus` and `init-args-num-cpus` size the Ray actor pool to **one
 actor** that serves all three sites — one Julia boot, one model compilation, no re-warm
 mid-fit (see [Architecture](architecture.md)).
+
+!!! tip "Troubleshooting: `does not appear to be a Python project`"
+    This error means you are not in the repository root. `cd` into the cloned
+    `NoLimitsFlowerDemo` directory (the one holding `pyproject.toml`) and retry from there.
+
+!!! note "Optional: a pinned shared Julia project"
+    By default juliapkg resolves NoLimits >= 0.2.6 from the registry, which is all the steps
+    above need. To share one pinned env across every entry point (`julia_env/`, gitignored),
+    use the Julia minor version juliapkg selects and point Python at it:
+
+    ```bash
+    julia +1.11 -e 'import Pkg; Pkg.activate("julia_env");
+                    Pkg.add([Pkg.PackageSpec(name="NoLimits", version="0.2.6"),
+                             Pkg.PackageSpec(name="PythonCall")])'
+    export PYTHON_JULIAPKG_PROJECT="$PWD/julia_env"
+    export PYTHON_JULIAPKG_OFFLINE=yes
+    ```
 
 ## The knobs at a glance
 
