@@ -69,8 +69,9 @@ good approximation and you want the pharmacometrics-standard estimator.
 ## `ghq` — Gauss-Hermite quadrature
 
 ```bash
-# The federated GHQ *fit* is optimizer-fragile above level 1 on this small data (caveat
-# below); ghq-level=1 is the level that reliably passes the one-sided gate here.
+# ghq-level=1 (the [tool.flwr.app.config] default) is the level whose federated fit reliably
+# converges to the pooled optimum on this small data; levels 2-3 converge to a rougher local
+# optimum (caveat below).
 flwr run . --stream --run-config 'estimator="ghq" ghq-level=1 max-rounds=200' \
   --federation-config "num-supernodes=3 client-resources-num-cpus=3 init-args-num-cpus=3"
 ```
@@ -80,25 +81,31 @@ a Gauss-Hermite grid, rather than approximating it at the mode. Higher `ghq-leve
 quadrature nodes.
 
 !!! warning "The `ghq-level` local-optima caveat — honest"
-    The quadrature objective is **rough** on this model, and the federated GHQ *fit* is
-    fragile above level 1 on the warfarin data (measured, current scipy L-BFGS-B):
+    The quadrature objective is **rough** on this model, so the federated L-BFGS-B and
+    `fit_model`'s Optim LBFGS can settle in **different local optima** above level 1
+    (measured on the warfarin data, current scipy). Every level *converges* — none aborts —
+    but only level 1 lands on the pooled optimum:
 
-    - **level 1** completes cleanly and passes the one-sided gate — the federated optimum
-      equals the pooled `fit_model` optimum to `1e-8` (about 23 rounds).
-    - **level 2** completes, but the federated L-BFGS-B and `fit_model`'s Optim LBFGS
-      **settle in different local optima** and the federated one lands `6.1e-03` *worse* than
-      pooled, so the one-sided gate **fails**.
-    - **level 3** (the `[tool.flwr.app.config]` default) can drive L-BFGS-B's line search
-      into a `theta` where a site's marginal is **non-finite**; the demo's fault policy — a
-      non-finite site contribution aborts the fit (see [Architecture](architecture.md)) —
-      then **aborts the run** mid-optimization.
+    - **level 1** converges in ~23 rounds and passes the one-sided gate: the federated
+      optimum equals the pooled `fit_model` optimum to `4e-14`.
+    - **level 2** converges (~81 rounds) but lands `6.1e-03` *worse* than pooled, so the
+      one-sided gate **fails**.
+    - **level 3** converges (~68 rounds) but lands `3.6e-02` *worse* than pooled, so the
+      one-sided gate **fails**.
 
     None of this is a federation error: the summed objective **is** the pooled objective
     exactly (additivity `2.3e-16`, verified by the probe). It is an optimizer-path problem —
     two different optimizers on the same non-convex, rough surface — which is why the run can
     only ever apply a **one-sided** gate ("no worse than pooled") and why, on this demo's
-    small sites, only `ghq-level=1` currently satisfies it. NoLimits' own default is level 3,
-    but for a robust federated fit on this demo prefer `laplace` or `focei`.
+    small sites, only `ghq-level=1` currently satisfies it.
+
+    A rough GHQ probe *theta* whose marginal is non-finite no longer aborts the fit: the
+    site reports the non-finite contribution as a normal reply and the server backtracks on a
+    finite penalty, so L-BFGS-B steps back and continues (a genuine **site failure** — an
+    error reply — still aborts, see [Architecture](architecture.md)). Before that fix, level 3
+    could drive the line search into such a *theta* and abort mid-optimization; it now
+    converges (to the rougher optimum above). For a robust federated fit on this demo, prefer
+    `laplace` or `focei`, or keep `ghq-level=1`.
 
 **Reach for it** when you want a quadrature-based marginal likelihood rather than a
 mode-based one, and are prepared to tune `ghq-level` per data set; on this demo only level 1

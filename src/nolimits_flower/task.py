@@ -650,13 +650,22 @@ def dp_batch_contributions(nl, dm, theta_transformed, estimator: str, ghq_level:
     return vals, grads, int(maxids)
 
 
-def objective_and_gradient(nl, dm, theta_transformed, estimator: str, ghq_level: int):
-    """(value, gradient-on-transformed-axes) for one DataModel at a wire vector."""
+def objective_and_gradient(nl, dm, theta_transformed, estimator: str, ghq_level: int,
+                           require_finite: bool = True):
+    """(value, gradient-on-transformed-axes) for one DataModel at a wire vector.
+
+    `require_finite` is the fail-fast default for the reference/probe/fit paths, where a
+    non-finite result at a fixed well-defined theta means a real bug. The FEDERATED round
+    handler passes `require_finite=False`: a non-finite marginal at an optimizer's rough
+    line-search probe is a legitimate estimator result, not a site failure, so the site must
+    reply successfully with it and let the server backtrack on a finite penalty. Raising here
+    would turn it into an error reply that the server's genuine-site-failure guard aborts on.
+    """
     method = _method(nl, estimator, ghq_level)
     value, grad = nl.seval("nlf_objgrad")(dm, np.asarray(theta_transformed, dtype=float), method)
     value = float(value)
     grad = np.asarray(grad, dtype=float)
-    if not np.isfinite(value) or not np.all(np.isfinite(grad)):
+    if require_finite and (not np.isfinite(value) or not np.all(np.isfinite(grad))):
         raise RuntimeError(f"non-finite objective/gradient at theta={theta_transformed}")
     return value, grad
 

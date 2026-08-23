@@ -46,9 +46,11 @@ the preconditioned coordinate `z` (chain rule: `grad_z = s * grad_theta`).
 `broadcast` (`server_app.broadcast`) sends the current `theta` to every node via
 `_send_all`, then returns `[(site_id, value, gradient)]`. `_send_all`
 (`server_app._send_all`) builds one `Message` per node, calls `grid.send_and_receive`, and
-**raises on any failure** — a missing reply, an error reply, or (checked in `broadcast`) a
-non-finite contribution. A federated sum is only meaningful if every site is in it, so a
-site failure aborts the whole fit rather than summing the survivors.
+**raises on a site failure** — a missing reply or an error reply. A federated sum is only
+meaningful if every site is in it, so a site failure aborts the whole fit rather than summing
+the survivors. A non-finite *contribution* is not a failure: the site replies with it and the
+`federated` objective closure returns a large finite penalty on a non-finite summed value or
+gradient, so L-BFGS-B backtracks instead of aborting.
 
 ### `maxfun` is the round cap
 

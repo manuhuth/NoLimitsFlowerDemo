@@ -249,18 +249,20 @@ Two of the four need a caveat, and both caveats are about the *optimizer*, not t
   omega only through `exp(omega^2/2)`, so the objective is nearly flat in the omegas. The two
   fits agree to 1.8e-10 in the objective while `omega_cl` differs by 2.8e-03 - a plateau, not
   a federation error.
-- **`ghq` gets a one-sided gate, and its fit is optimizer-fragile above level 1.** The
-  quadrature objective is rough on this model, so scipy's L-BFGS-B and `fit_model`'s Optim
+- **`ghq` gets a one-sided gate, and its fit lands in different local optima above level 1.**
+  The quadrature objective is rough on this model, so scipy's L-BFGS-B and `fit_model`'s Optim
   LBFGS settle in *different* local optima and a parameter-wise gate is unreachable; the run
   therefore asserts only what federation is responsible for - the summed objective is the
   pooled objective (additivity 2.3e-16, verified by the probe) and the federated optimum is
-  *no worse* than the pooled one. On this demo's small warfarin sites (current scipy) only
-  `ghq-level=1` actually satisfies that gate: level 1 completes and the federated optimum
-  equals the pooled fit to 1e-8 (~23 rounds); level 2 completes but lands 6.1e-03 *worse*
-  than pooled, failing the gate; level 3 (the config default) can drive the line search into
-  a `theta` where a site's marginal is non-finite, which the demo's fault policy turns into a
-  mid-fit abort. None of this is a federation error - it is two optimizers on one non-convex
-  surface - but for a robust federated fit prefer `laplace` or `focei`.
+  *no worse* than the pooled one. On this demo's small warfarin sites (current scipy) every
+  level *converges* - none aborts - but only `ghq-level=1` satisfies that gate: level 1's
+  federated optimum equals the pooled fit to 4e-14 (~23 rounds); level 2 lands 6.1e-03 *worse*
+  than pooled (~81 rounds) and level 3 lands 3.6e-02 *worse* (~68 rounds), both failing the
+  gate. A rough probe `theta` whose marginal is non-finite no longer aborts the fit: the site
+  reports it as a normal reply and the server backtracks on a finite penalty (only a genuine
+  site error aborts). None of this is a federation error - it is two optimizers on one
+  non-convex surface - but for a robust federated fit prefer `laplace` or `focei`, or keep the
+  `ghq-level=1` default.
 
 SAEM and MCEM are not federated; they need a per-site E-step sufficient-statistics primitive
 upstream in NoLimits. `MLE` and `MAP` have the protocol too but require a model without
@@ -364,7 +366,7 @@ Run-config knobs (`--run-config 'key=value ...'`):
 |---|---|---|
 | `model` | `"warfarin"` | `warfarin`, `theophylline`, `warfarin-nn` (neural) or `orange` (growth); see *Models* |
 | `estimator` | `"laplace"` | `laplace`, `focei`, `ghq` (Gauss-Hermite quadrature) or `pooled` (naive-pooled plug-in); see *Estimators*. The non-warfarin models default to and are documented for `laplace` |
-| `ghq-level` | 3 | quadrature level when `estimator="ghq"`; 1 to 3 is NoLimits' numerically stable range |
+| `ghq-level` | 1 | quadrature level when `estimator="ghq"`; level 1 reliably converges to the pooled optimum here, levels 2-3 converge to a rougher local optimum (see *Estimators*). 1 to 3 is NoLimits' numerically stable range |
 | `data-source` | `"warfarin"` | the real warfarin PK data, or `"simulated"` for the seeded synthetic set |
 | `data-seed` | 20260818 | which simulated data set; ignored when `data-source="warfarin"` |
 | `max-rounds` | 100 | cap on federated rounds (L-BFGS-B `maxfun`) |
@@ -435,10 +437,9 @@ flower-superlink`) before switching branches or debugging a run that seems to ha
 
 ## Failure handling
 
-A federated sum is only meaningful if every site is in it. If a site errors, becomes
-unreachable, or returns a non-finite contribution (NoLimits reports `-Inf` on a failed
-solve), the server aborts the whole fit with one actionable line naming the site, the node
-and the site's own error message. It never sums the survivors and never reports a partial
+A federated sum is only meaningful if every site is in it. If a site **errors** or becomes
+**unreachable**, the server aborts the whole fit with one actionable line naming the site, the
+node and the site's own error message. It never sums the survivors and never reports a partial
 optimum. Observed with `fail-site=1`:
 
 ```
@@ -449,6 +450,12 @@ ERROR: FEDERATED FIT ABORTED: round 1: site unknown (first round) (node 39638788
 
 Site ids are learned from successful replies, because an error reply carries no content;
 a site that fails in the very first round can only be named by its node id.
+
+A **non-finite contribution is not a site failure**. NoLimits reports `-Inf`/`NaN` when an
+optimizer probes a rough or out-of-domain `theta` (the GHQ objective does this above level 1),
+and the site reports that value as a normal, successful reply. When the summed objective or
+gradient is non-finite, the server does not abort: it returns a large *finite* penalty so
+scipy L-BFGS-B backtracks and the fit continues. Only a genuine error or missing reply aborts.
 
 `fail-site` exists solely to test this path and is exercised by the slow test suite. Leave
 it at its `-1` default.

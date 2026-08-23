@@ -90,9 +90,14 @@ the aggregate the optimizer consumes is the same summed quantity.
 
 ## Failure handling
 
-A federated sum is only meaningful if every site is in it. If a site errors, becomes
-unreachable, or returns a non-finite contribution (NoLimits reports `-Inf` on a failed
-solve), the server aborts the whole fit with one actionable line naming the site, the node
-and the site's own error message (`server_app._send_all`, `broadcast`, `_short_reason`). It
-never sums the survivors and never reports a partial optimum. The `fail-site` run-config knob
-exists solely to test this path and defaults to `-1` (off).
+A federated sum is only meaningful if every site is in it. If a site **errors** or becomes
+**unreachable**, the server aborts the whole fit with one actionable line naming the site, the
+node and the site's own error message (`server_app._send_all`, `_short_reason`). It never sums
+the survivors and never reports a partial optimum. The `fail-site` run-config knob exists
+solely to test this path and defaults to `-1` (off).
+
+A **non-finite contribution is not a failure**. When an optimizer probes a rough or
+out-of-domain `theta`, NoLimits reports `-Inf`/`NaN`; the site returns that as a normal reply,
+and if the *summed* objective or gradient is non-finite the objective closure returns a large
+*finite* penalty (`server_app._fit`, the `federated` closure) so L-BFGS-B backtracks and the
+fit continues instead of aborting.

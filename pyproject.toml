@@ -36,7 +36,9 @@ clientapp = "nolimits_flower.client_app:app"
 [tool.flwr.app.config]
 model = "warfarin"  # warfarin | theophylline | warfarin-nn | orange (see README Models)
 estimator = "laplace"
-ghq-level = 3  # NoLimits' own default; levels 1-3 are its numerically stable range
+ghq-level = 1  # the level whose federated fit reliably converges to the pooled optimum on
+               # this demo (levels 2-3 converge but to a rougher GHQ local optimum; see
+               # docs/estimators.md). NoLimits' own numerically stable range is 1-3.
 data-source = "warfarin"  # or "simulated" for the seeded synthetic demo
 data-seed = 20260818  # which simulated data set; ignored by data-source="warfarin"
 max-rounds = 100

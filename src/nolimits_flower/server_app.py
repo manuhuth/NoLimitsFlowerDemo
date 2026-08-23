@@ -192,7 +192,14 @@ def prepare(grid: Grid, config: ConfigRecord):
 
 
 def broadcast(grid: Grid, theta: np.ndarray, config: ConfigRecord, rnd: int):
-    """Send theta to every node; return [(site_id, value, gradient)]. Raises on any failure."""
+    """Send theta to every node; return [(site_id, value, gradient)]. Raises on a SITE failure.
+
+    A site that fails to reply or replies with an error aborts here (via `_send_all`). A site
+    that replies successfully with a non-finite value/gradient does NOT abort: that is a
+    legitimate estimator result at a rough/out-of-domain theta (the optimizer probes those),
+    not a site failure. The summed non-finite case is handled by the objective closure, which
+    backtracks on a finite penalty instead of killing an otherwise-converging fit.
+    """
     replies = _send_all(
         grid, "query", {"theta": ArrayRecord([theta]), "config": config}, f"round {rnd}"
     )
@@ -204,12 +211,6 @@ def broadcast(grid: Grid, theta: np.ndarray, config: ConfigRecord, rnd: int):
         _SITE_OF_NODE[node] = site_id
         value = float(metrics["value"])
         gradient = reply.content["gradient"].to_numpy_ndarrays()[0]
-        # A -Inf / NaN site contribution (failed solve) must never be summed.
-        if not np.isfinite(value) or not np.all(np.isfinite(gradient)):
-            raise SiteFailure(
-                f"round {rnd}: non-finite contribution from site {site_id} (node {node}, "
-                f"value={value}) - aborting the federated fit"
-            )
         out.append((site_id, value, gradient))
     return out
 
@@ -495,6 +496,15 @@ def _fit(grid: Grid, context: Context) -> None:
     # volume of ~8 with unit-size log-parameters, which costs L-BFGS-B extra evaluations.
     s = task.precondition_scale(x0, mask)
 
+    # Large FINITE objective returned when every site replied but the summed value/gradient is
+    # non-finite. The server minimizes -loglik, so a bad theta (loglik -> -Inf) maps to +Inf;
+    # we cap it at a large positive number instead. L-BFGS-B backtracks reliably on a finite
+    # penalty but handles inf/nan poorly, so a rough-GHQ line-search probe of an out-of-domain
+    # theta no longer kills an otherwise-converging fit. This is NOT the site-failure path -
+    # that still aborts in _send_all; here all sites answered, the estimator just left its
+    # numerical domain. Zero gradient so the line search steps back toward the last good point.
+    nonfinite_penalty = 1.0e12
+
     def federated(z: np.ndarray):
         nonlocal rounds, max_round_wall
         rounds += 1
@@ -505,6 +515,12 @@ def _fit(grid: Grid, context: Context) -> None:
         grad = np.sum([g for _, _, g in sites], axis=0)
         round_wall = time.perf_counter() - t_round
         max_round_wall = max(max_round_wall, round_wall)
+        if not np.isfinite(value) or not np.all(np.isfinite(grad)):
+            log(WARNING, "round %d: non-finite summed objective (value=%.3e) at a probe theta; "
+                "all %d sites replied, so this is an out-of-domain optimizer probe, not a site "
+                "failure - returning a finite penalty so L-BFGS-B backtracks", rounds, value,
+                len(sites))
+            return nonfinite_penalty, np.zeros_like(x0)
         log(INFO, "round %d: loglik=%.10f |grad|=%.3e sites=%d wall=%.2fs", rounds, value,
             np.linalg.norm(grad), len(sites), round_wall)
         return -value, -(s * grad)  # L-BFGS-B minimizes; the sites report a log-likelihood

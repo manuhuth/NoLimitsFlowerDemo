@@ -157,12 +157,16 @@ def site_objective(msg: Message, context: Context) -> Message:
             }),
             reply_to=msg,
         )
+    # require_finite=False: a non-finite marginal at an optimizer probe theta is a legitimate
+    # estimator result, so reply successfully with it and let the server backtrack on a finite
+    # penalty. A genuine site error (a Julia solve that throws) still propagates and aborts.
     value, gradient = task.objective_and_gradient(
         nl,
         _site_dm(context),
         theta,
         str(config["estimator"]),
         int(config["ghq-level"]),
+        require_finite=False,
     )
     metrics = MetricRecord({
         "value": value,
