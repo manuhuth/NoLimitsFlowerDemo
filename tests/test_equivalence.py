@@ -53,7 +53,11 @@ def run_federated(run_config: str, timeout: float = 1800.0) -> str:
     deadline = time.time() + timeout
     while time.time() < deadline:
         log = _flwr("log", str(run_id), "--show", timeout=120.0)
-        if re.search(r"PASS:|ABORTED|acceptance failed|gate failed|Exit Code", log):
+        # Only TERMINAL outcomes end the poll. The NN additivity gate logs an early
+        # "PASS: NN site contributions are additive" mid-run; matching a bare "PASS:"
+        # would return before the fit's terminal "PASS: NN federation is exact".
+        if re.search(r"PASS: (?:federated|NN federation)|ABORTED|acceptance failed|"
+                     r"gate failed|Exit Code", log):
             return log
         time.sleep(10.0)
     raise AssertionError(f"run {run_id} did not finish within {timeout}s")

@@ -39,7 +39,8 @@ def test_per_model_primary_id_and_time_col():
 
 
 def test_per_model_column_maps():
-    assert task.spec("warfarin").columns == {"id": "ID", "t": "t", "d": "Dose", "C": "conc"}
+    assert task.spec("warfarin").columns == {"id": "ID", "time": "t", "amt": "Dose", "dv": "conc"}
+    assert task.spec("warfarin-nn").columns == {"id": "id", "time": "t", "amt": "d", "dv": "C"}
     assert task.spec("theophylline").columns["Subject"] == "id"
     assert task.spec("theophylline").columns["Time"] == "t"
     assert task.spec("orange").columns == {"Tree": "Tree", "age": "age", "circumference": "circumference"}

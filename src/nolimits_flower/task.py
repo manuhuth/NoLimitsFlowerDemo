@@ -188,8 +188,10 @@ DEFAULT_SEED = 20260818
 DEFAULT_SOURCE = "warfarin"
 DEFAULT_MODEL = "warfarin"
 
-# Raw Monolix warfarin frame, committed to data/warfarin.csv (small real public data) so
-# the demo is offline; downloaded through NoLimits' loader only if the file is missing.
+# The GPL-3 nlmixr2data warfarin frame committed verbatim to data/warfarin.csv (same
+# O'Reilly PK/PD study; see data/README.md). Long format: id,time,amt,dv,dvid(cp/pca),
+# evid,wt,age,sex. The demo's models are PK only, so the loaders keep the concentration
+# (dvid=="cp") observations and carry each subject's dose as a constant covariate.
 WARFARIN_CACHE = DATA / "warfarin.csv"
 
 # Defined once per Julia session; the client only ever calls `nlf_objgrad`.
@@ -238,16 +240,6 @@ function nlf_objgrad(dm, v, method)
 end
 """
 
-# Downloads the Monolix warfarin data through NoLimits' loader if the cache is missing.
-WARFARIN_JULIA = """
-import CSV
-function nlf_warfarin_cache(path)
-    mkpath(dirname(path))
-    CSV.write(path, NoLimits.load_warfarin_from_monolix())
-    return path
-end
-"""
-
 
 def simulate(seed: int = DEFAULT_SEED, n_subjects: int = N_SUBJECTS) -> pd.DataFrame:
     """Seeded synthetic warfarin data at TRUE_THETA (closed-form ODE, no solver)."""
@@ -270,13 +262,21 @@ def simulate(seed: int = DEFAULT_SEED, n_subjects: int = N_SUBJECTS) -> pd.DataF
 
 
 def _warfarin_raw(nl=None) -> pd.DataFrame:
-    """The cached raw Monolix warfarin frame; downloads once if the cache is missing."""
-    if not WARFARIN_CACHE.exists():
-        if nl is None:
-            import NoLimitsPy as nl
-        nl.seval(WARFARIN_JULIA)
-        nl.seval("nlf_warfarin_cache")(str(WARFARIN_CACHE))
-    return pd.read_csv(WARFARIN_CACHE)
+    """PK frame from the committed nlmixr2data warfarin CSV, as id/t/d/C.
+
+    nlmixr2data warfarin is long PK/PD: keep the concentration observations
+    (dvid=="cp", evid==0) and carry each subject's single dose (amt on its evid==1 row)
+    as a constant covariate on every row.
+    """
+    raw = pd.read_csv(WARFARIN_CACHE)
+    dose = raw.loc[raw["evid"] == 1].set_index("id")["amt"]
+    cp = raw[(raw["dvid"] == "cp") & (raw["evid"] == 0)]
+    return pd.DataFrame({
+        "id": cp["id"].astype(str).to_numpy(),
+        "t": cp["time"].to_numpy(dtype=float),
+        "d": dose.reindex(cp["id"]).to_numpy(dtype=float),
+        "C": cp["dv"].to_numpy(dtype=float),
+    })
 
 
 def load_warfarin(source: str = DEFAULT_SOURCE, seed: int = DEFAULT_SEED, nl=None) -> pd.DataFrame:
@@ -286,9 +286,8 @@ def load_warfarin(source: str = DEFAULT_SOURCE, seed: int = DEFAULT_SEED, nl=Non
     if source != "warfarin":
         raise ValueError(f"unknown data-source {source!r} (expected 'warfarin' or 'simulated')")
     pk = _warfarin_raw(nl)
-    pk = pk[pk["C"].notna()]
     return pd.DataFrame({
-        "ID": pk["id"].astype(str).to_numpy(),
+        "ID": pk["id"].to_numpy(),
         "t": pk["t"].to_numpy(dtype=float),
         "Dose": pk["d"].to_numpy(dtype=float),
         "conc": pk["C"].to_numpy(dtype=float),
@@ -297,14 +296,7 @@ def load_warfarin(source: str = DEFAULT_SOURCE, seed: int = DEFAULT_SEED, nl=Non
 
 def load_warfarin_nn(source: str = DEFAULT_SOURCE, seed: int = DEFAULT_SEED, nl=None) -> pd.DataFrame:
     """The SAME real warfarin PK rows in the neural model's raw columns id/t/d/C."""
-    pk = _warfarin_raw(nl)
-    pk = pk[pk["C"].notna()]
-    return pd.DataFrame({
-        "id": pk["id"].astype(str).to_numpy(),
-        "t": pk["t"].to_numpy(dtype=float),
-        "d": pk["d"].to_numpy(dtype=float),
-        "C": pk["C"].to_numpy(dtype=float),
-    })
+    return _warfarin_raw(nl)
 
 
 def load_theoph(source: str = DEFAULT_SOURCE, seed: int = DEFAULT_SEED, nl=None) -> pd.DataFrame:
@@ -346,7 +338,7 @@ class ModelSpec:
 CATALOG = {
     "warfarin": ModelSpec(
         model=WARFARIN_MODEL, loader=load_warfarin, primary_id="ID", time_col="t",
-        columns={"id": "ID", "t": "t", "d": "Dose", "C": "conc"}, num_sites=3,
+        columns={"id": "ID", "time": "t", "amt": "Dose", "dv": "conc"}, num_sites=3,
     ),
     "theophylline": ModelSpec(
         model=THEOPH_MODEL, loader=load_theoph, primary_id="id", time_col="t",
@@ -355,7 +347,7 @@ CATALOG = {
     ),
     "warfarin-nn": ModelSpec(
         model=WARFARIN_NN_MODEL, loader=load_warfarin_nn, primary_id="id", time_col="t",
-        columns={"id": "id", "t": "t", "d": "d", "C": "C"}, num_sites=3,
+        columns={"id": "id", "time": "t", "amt": "d", "dv": "C"}, num_sites=3,
         acceptance="nn", pooled_init=True, fit_seed=1234,
     ),
     "orange": ModelSpec(

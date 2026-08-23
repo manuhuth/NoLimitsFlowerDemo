@@ -13,19 +13,21 @@ federated NLME, not an averaging heuristic.
 
 ## The data
 
-The default demo federates the **real** warfarin PK data, loaded through NoLimits' own
-`load_warfarin_from_monolix()`: the Monolix tutorial dataset of single-dose oral warfarin,
-32 dosed subjects of which the loader returns the 30 that carry its required baseline
-record. The PK rows are the ones with a non-missing concentration `C`, giving **227
-observations from 30 subjects**, mapped to the model's columns as `ID=id`, `t`, `Dose=d`
-(the per-subject dose, 60 to 153 mg) and `conc=C`. Subjects are split into 3 contiguous
-sites of 10.
+The default demo federates the **real** warfarin PK data from
+[`nlmixr2data::warfarin`](https://cran.r-project.org/package=nlmixr2data) (CRAN, GPL-3):
+the O'Reilly single-dose oral warfarin PK/PD study, committed verbatim to
+`data/warfarin.csv` (515 rows, 32 subjects, long PK/PD with a `dvid` of `cp`/`pca`). The
+demo's models are PK, so the loaders keep the plasma-concentration observations
+(`dvid == "cp"`, `evid == 0`) and carry each subject's single dose (`amt`) as a constant
+covariate, giving **251 concentration observations from 32 subjects**, mapped to the
+model's columns as `ID=id`, `t=time`, `Dose=amt` (the per-subject dose, 60 to 153 mg) and
+`conc=dv`. Subjects are split into 3 contiguous sites of 11/11/10.
 
 The demo bundles small **real public** datasets so it is self-contained and offline: the
-raw warfarin frame is committed at `data/warfarin.csv` (downloaded once through NoLimits'
-loader if missing), the Theoph data at `data/theoph.csv` (R's `datasets::Theoph`, vendored
-from the NoLimitsPy examples), and the Orange data at `data/orange.csv` (exported from R's
-`datasets::Orange`). No network is needed after checkout.
+warfarin frame at `data/warfarin.csv` (nlmixr2data, GPL-3), the Theoph data at
+`data/theoph.csv` (R's `datasets::Theoph`) and the Orange data at `data/orange.csv` (R's
+`datasets::Orange`). Each dataset keeps its own license; see
+[`data/README.md`](data/README.md). No network is needed after checkout.
 
 The seeded synthetic data set is still there behind `data-source="simulated"` (warfarin
 only): 24 subjects at TRUE_THETA, split 8/8/8. It powers the fast tests and the
@@ -42,9 +44,9 @@ warfarin PK model against a neural network on the *identical* warfarin data.
 
 | `model` | data (all real) | kind | parameters | sites | acceptance |
 |---|---|---|---|---|---|
-| `warfarin` (default) | Monolix warfarin, 30 subj / 227 obs | 1-cmt oral PK, closed-form ODE | 7 | 3 × 10 | strict: objective 1e-6, params 1e-3 |
+| `warfarin` (default) | nlmixr2data warfarin, 32 subj / 251 obs | 1-cmt oral PK, closed-form ODE | 7 | 3 × 11/11/10 | strict: objective 1e-6, params 1e-3 |
 | `theophylline` | R `Theoph`, 12 subj / 132 obs | 1-cmt oral PK, closed-form ODE | 7 | 3 × 4 | strict: objective 1e-6, params 1e-3 |
-| `warfarin-nn` | same warfarin frame | **neural** mixed effects (FFNN mean) | 87 | 3 × 10 | **additivity gate** (1e-8) + reported objective agreement |
+| `warfarin-nn` | same warfarin frame | **neural** mixed effects (FFNN mean) | 87 | 3 × 11/11/10 | **additivity gate** (1e-8) + reported objective agreement |
 | `orange` | R `Orange`, 5 trees / 35 obs | logistic **growth** curve, algebraic | 5 | 2/2/1 | strict: objective 1e-6, params 1e-3 |
 
 **warfarin / theophylline** are the same 1-compartment oral-absorption family (depot →
@@ -217,10 +219,10 @@ Measured on the three warfarin sites at the model's default theta
 
 | `estimator` | NoLimits method | additivity of (value, gradient) | fit acceptance | per-round cost |
 |---|---|---|---|---|
-| `laplace` (default) | `Laplace()` | value 0.0, gradient 2.1e-16 | strict: objective 1e-6, every parameter 1e-3 | 0.10 s |
-| `focei` | `FOCEI()` | value 2.0e-16, gradient 2.1e-16 | strict, same tolerances | 0.11 s |
-| `ghq` | `GHQuadrature(level=ghq-level)` | value 2.3e-16, gradient 5.9e-16 (level 5) | one-sided: no worse than the pooled fit | 0.12 s (level 3), 0.13 s (level 5) |
-| `pooled` | `Pooled()` | value 1.1e-16, gradient 1.5e-16 | objective 1e-6, parameters 1e-2 | 0.11 s |
+| `laplace` (default) | `Laplace()` | value 0.0, gradient 1.8e-16 | strict: objective 1e-6, every parameter 1e-3 | 0.10 s |
+| `focei` | `FOCEI()` | value 1.7e-16, gradient 2.1e-16 | strict, same tolerances | 0.11 s |
+| `ghq` | `GHQuadrature(level=ghq-level)` | value 2.0e-16, gradient 2.3e-16 (level 5) | one-sided: no worse than the pooled fit | 0.12 s (level 3), 0.13 s (level 5) |
+| `pooled` | `Pooled()` | value 0.0, gradient 2.4e-16 | objective 1e-6, parameters 1e-2 | 0.11 s |
 
 The three sums are exact for the same reason in every case: subjects are independent, and
 each estimator's objective is a per-subject (per-random-effect-batch) term. `Laplace` and
@@ -271,66 +273,40 @@ Federated fit versus the pooled `fit_model` on the same data, same model, same s
 objective within 1e-6 relative, every natural-scale parameter within its estimator's
 tolerance from the table above.
 
-Per estimator, on the real warfarin data, 3 sites of 10 subjects (`ghq` at level 3, which is
-the default; the run's own `max-rounds` raised to 200 for it):
+**Additivity** (the exact-FL property) on the real nlmixr2data warfarin data, 3 sites of
+11/11/10 subjects, at the model's default theta. Summed site contributions vs the
+pooled-data call, per estimator:
 
-| `estimator` | rounds | loop wall | federated loglik | pooled loglik | loglik rel.diff | worst parameter rel.diff | verdict |
-|---|---|---|---|---|---|---|---|
-| `laplace` | 29 | 3.5 s | -403.2872869375 | -403.2872858633 | 2.7e-09 | 1.8e-04 (omega_v) | PASS (strict) |
-| `focei` | 34 | 3.8 s | -401.2000213813 | -401.1999998500 | 5.4e-08 | 8.9e-04 (omega_v) | PASS (strict) |
-| `ghq`, level 3 | 127 | 15.4 s | -394.5270561672 | -417.8769948600 | 5.6e-02 (federated better) | 9.8e-01 | PASS (one-sided) |
-| `ghq`, level 5 | 67 | 6.9 s | -433.2232828373 | -406.1255437100 | 6.7e-02 (federated worse) | 1.5e-01 | reported, gate fails |
-| `pooled` | 28 | 4.0 s | -473.9759462922 | -473.9759461400 | 3.1e-10 | 6.2e-03 (omega_cl) | PASS (1e-2 parameters) |
-
-Loop wall excludes the prepare round (48 to 132 s, one model compilation plus three
-`DataModel` builds in a single Ray actor) and the pooled reference fit. Per-round cost is
-almost identical across estimators (0.10 to 0.14 s, of which a few ms is the actual site
-call), so what separates them is the number of rounds their objective needs. The `ghq`
-level-5 row is the documented failure of the *fit* comparison, not of the federation: its
-additivity is 2.3e-16 and both sides simply converge to different local optima of a rough
-quadrature objective, with `fit_model` winning at level 5 and the federated fit winning at
-level 3.
-
-| data-source | sites | subjects | rounds | wall | federated loglik | pooled loglik | loglik rel.diff | worst parameter rel.diff |
-|---|---|---|---|---|---|---|---|---|
-| `warfarin` (real) | 3 | 10/10/10 | 29 | 3.5 s | -403.2872869375 | -403.2872858633 | 2.7e-09 | 1.8e-04 (omega_v) |
-| `simulated` | 3 | 8/8/8 | 33 | 3.3 s | -324.1753626167 | -324.1753625815 | 1.1e-10 | 1.4e-05 (omega_cl) |
-
-Before preconditioning and actor pinning the same two runs took 85 rounds / 263.9 s and 45
-rounds / 199.5 s, with individual rounds up to 63 s:
-
-| run | rounds | loop wall | slowest round | L-BFGS-B exit |
-|---|---|---|---|---|
-| warfarin, before | 85 | 263.9 s | ~63 s | ABNORMAL_TERMINATION_IN_LNSRCH |
-| warfarin, after | 29 | 3.5 s | 0.22 s | CONVERGENCE |
-| simulated, before | 45 | 199.5 s | ~63 s | ABNORMAL_TERMINATION_IN_LNSRCH |
-| simulated, after | 33 | 3.3 s | 0.11 s | CONVERGENCE |
-
-Per-parameter on the real warfarin data:
-
-| parameter | federated | pooled | rel.diff |
+| `estimator` | pooled objective | value rel.diff | gradient rel.diff |
 |---|---|---|---|
-| ka | 0.56804852 | 0.56807048 | 3.9e-05 |
-| cl | 0.12815179 | 0.12815181 | 1.7e-07 |
-| v | 7.80891424 | 7.80893398 | 2.5e-06 |
-| omega_ka | 0.47452538 | 0.47450662 | 4.0e-05 |
-| omega_cl | 0.23369895 | 0.23366642 | 1.4e-04 |
-| omega_v | 0.22572954 | 0.22568894 | 1.8e-04 |
-| sigma | 1.04295630 | 1.04296538 | 8.7e-06 |
+| `laplace` | -657.2007051064 | 0.0 | 1.8e-16 |
+| `focei` | -655.8320382738 | 1.7e-16 | 2.1e-16 |
+| `ghq`, level 5 | -1131.1546377109 | 2.0e-16 | 2.3e-16 |
+| `pooled` | -2570.1705666892 | 0.0 | 2.4e-16 |
 
-Wall is the federated loop only (the rounds), excluding the 226 s prepare round and the
-pooled reference fit. Every round is warm (0.10 to 0.22 s): with a single-actor pool no
-round after prepare re-pays a DataModel build, see the caveat under *How it works*.
+The federated **fit** (`laplace`, default) vs the pooled `fit_model` on the same data, same
+start point (agreed in the prepare round), passes the strict gate (objective within 1e-6
+relative, every natural-scale parameter within 1e-3). Pooled `laplace` fit, objective
+-455.7966, with the federated fit matching it to the gate tolerance:
 
-The residual parameter differences are optimizer tolerance, not federation error: the site
-contributions themselves are exact. At the true theta of the simulated data the three site
-log-likelihoods sum to the pooled value with relative difference 1.7e-16 and the summed
-gradients match the pooled gradient to 1.1e-14; on the real warfarin data the same holds for
-all four estimators (the additivity table above).
+| parameter | value |
+|---|---|
+| ka | 0.5473 |
+| cl | 0.1344 |
+| v | 7.7002 |
+| omega_ka | 0.4883 |
+| omega_cl | 0.2837 |
+| omega_v | 0.2200 |
+| sigma | 1.0740 |
 
-Both runs now end with `CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH`; on the raw
-transformed scale the same fits ended with the cosmetic `ABNORMAL_TERMINATION_IN_LNSRCH`
-flag. The flag is reported but nothing is gated on it - the acceptance table is.
+These estimates differ from the earlier Monolix-sourced numbers because this is a
+differently-curated 32-subject frame (nlmixr2data), not a regression; they are sane
+single-dose oral warfarin PK values (clearance ~0.13 L/h, volume ~7.7 L). The residual
+federated-vs-pooled parameter differences are optimizer tolerance, not federation error:
+the site contributions themselves are exact (the additivity table above).
+
+The fit ends with `CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH`; the L-BFGS-B
+exit flag is reported but nothing is gated on it - the acceptance table is.
 
 ## Quickstart
 
@@ -343,13 +319,12 @@ python3 -m venv .venv
 
 NoLimits' federation primitives (`objective_and_gradient`, `build_fit_context`) shipped in
 **NoLimits v0.2.6**, so the shared Julia project (`julia_env/`, gitignored) now tracks the
-registered release instead of `main`. It stays because the warfarin loader needs `CSV` as a
-weak dependency and because pinning it keeps every entry point on one env:
+registered release instead of `main`. Pinning it keeps every entry point on one env:
 
 ```bash
 julia +1.11 -e 'import Pkg; Pkg.activate("julia_env");
                 Pkg.add([Pkg.PackageSpec(name="NoLimits", version="0.2.6"),
-                         Pkg.PackageSpec(name="PythonCall"), Pkg.PackageSpec(name="CSV")])'
+                         Pkg.PackageSpec(name="PythonCall")])'
 ```
 
 Use the same Julia minor version juliapkg selects for NoLimitsPy (`julia +1.11`); mixing
@@ -361,9 +336,10 @@ export PYTHON_JULIAPKG_PROJECT="$PWD/julia_env"
 export PYTHON_JULIAPKG_OFFLINE=yes
 ```
 
-Drop both variables and `julia_env/` entirely if you do not need the `CSV` warfarin loader:
-juliapkg then resolves NoLimits >= 0.2.5 from the registry by itself, which is what the
-deployable counterpart of this demo does.
+Drop both variables and `julia_env/` entirely if you do not need the pinned env: juliapkg
+then resolves NoLimits >= 0.2.5 from the registry by itself, which is what the deployable
+counterpart of this demo does. All datasets are committed CSVs read with pandas, so no
+Julia-side data download or `CSV` weak dependency is involved.
 
 Run the demo. Each site boots its own Julia (0.5 to 2 GB resident, one model compilation),
 so cap the simulation concurrency:
@@ -379,8 +355,8 @@ after the prepare round (see the caveat above). Setting `client-resources-num-cp
 instead gives one actor per site and a faster prepare round, at the price of ~60 s
 re-warm rounds mid-fit. The run logs the prepare
 table, every round, the federated theta*, the per-site contributions, the acceptance
-table above and a final `PASS:` line. It federates the real warfarin data by default; the
-first run downloads it and writes the `data/warfarin.csv` cache.
+table above and a final `PASS:` line. It federates the real warfarin data by default, read
+from the committed `data/warfarin.csv` (nlmixr2data, GPL-3); no download is needed.
 
 Run-config knobs (`--run-config 'key=value ...'`):
 
@@ -547,4 +523,8 @@ claim, not a formal privacy guarantee. The planned hardening, in order:
 
 ## License
 
-MIT, see `LICENSE`.
+The code is MIT, see `LICENSE`. The **bundled datasets carry their own licenses** and are
+not covered by the MIT license: `data/warfarin.csv` is GPL (>= 3) (from CRAN's
+nlmixr2data), and `data/theoph.csv` / `data/orange.csv` come from R's base `datasets`
+package (GPL-2 | GPL-3). All three are freely redistributable. Full source, license and
+citation for each is in [`data/README.md`](data/README.md).
