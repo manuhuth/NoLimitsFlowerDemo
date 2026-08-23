@@ -1,29 +1,25 @@
-name: CI
+name: Nightly full suite
 
-# Fast push lane (the badge target): fast tests always, plus ONE representative
-# additivity check (warfarin). Additivity is model-agnostic - a per-subject sum that is
-# exact for any model - so one model is a sufficient push gate. The full matrix (all-model
-# additivity, federated fits, fault injection, neural model) runs nightly in nightly.yml.
+# The complete acceptance matrix, off the per-push path so a slow/red heavy suite never
+# blocks pushes: all-model additivity, the PK/growth federated fits, DP fits, fault
+# injection, AND the veryslow neural model. Runs on a nightly cron and on demand.
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  schedule:
+    - cron: "0 3 * * *"
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
 
 jobs:
-  test:
+  full:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
-      # Julia 1.11 is what juliapkg selects for NoLimitsPy, so julia_env must be built
-      # with the same minor version.
       - uses: julia-actions/setup-julia@v2
         with:
           version: "1.11"
@@ -34,10 +30,6 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      # The shared Julia project: registered NoLimits (>= 0.2.6 has the federation
-      # primitives) plus CSV for the warfarin loader. It exists only for CSV; without it
-      # juliapkg would resolve NoLimits by itself and the PYTHON_JULIAPKG_* pinning below
-      # could go too.
       - name: Build julia_env
         run: |
           julia -e 'import Pkg; Pkg.activate("julia_env");
@@ -45,8 +37,6 @@ jobs:
                              Pkg.PackageSpec(name="PythonCall"),
                              Pkg.PackageSpec(name="CSV")]); Pkg.precompile()'
 
-      # Editable install: nolimits_flower/__init__.py pins julia_env/ relative to the
-      # package, which only resolves to the repo checkout when installed in place.
       - name: Install Python packages
         run: |
           python -m pip install --upgrade pip
@@ -60,8 +50,6 @@ jobs:
           flwr --version
           python -c "import NoLimitsPy as nl; nl.seval('1'); print(nl.status())"
 
-      # The warfarin loader downloads once and caches to data/warfarin.csv; priming it
-      # here keeps the lane offline (and the additivity test skips without it).
       - name: Prime the warfarin data cache
         env:
           PYTHON_JULIAPKG_PROJECT: ${{ github.workspace }}/julia_env
@@ -71,10 +59,10 @@ jobs:
       - name: Fast tests
         run: pytest tests -m "not slow and not veryslow" -q
 
-      # One representative additivity check (warfarin only) - the core exactness proof, one
-      # model compile. NOT the full federated fits or all-model additivity.
-      - name: Warfarin additivity (push gate)
+      # Everything heavy: all-model additivity, federated fits, DP, fault injection, and
+      # the veryslow neural model.
+      - name: Full equivalence suite
         env:
           PYTHON_JULIAPKG_PROJECT: ${{ github.workspace }}/julia_env
           PYTHON_JULIAPKG_OFFLINE: "yes"
-        run: pytest tests -m slow -k "test_site_contributions_add_up and warfarin and not nn" -q -s
+        run: pytest tests -m "slow or veryslow" -q -s
