@@ -236,14 +236,14 @@ def _dp_options(run_config, estimator: str):
             "to clip and no bounded sensitivity. Use laplace, focei or ghq."
         )
     dp = {
-        "clip": float(run_config.get("dp-clip", 1.0)),
+        "clip": float(run_config.get("dp-clip", 20.0)),
         "noise-multiplier": float(run_config.get("dp-noise-multiplier", 1.0)),
         "rounds": int(run_config.get("dp-rounds", 50)),
         "lr": float(run_config.get("dp-lr", 0.05)),
         "delta": float(run_config.get("dp-delta", 1.0e-5)),
         "final-value": bool(run_config.get("dp-final-value", False)),
         "value-clip": float(run_config.get("dp-value-clip", 100.0)),
-        "clip-mode": str(run_config.get("dp-clip-mode", "joint")),
+        "clip-mode": str(run_config.get("dp-clip-mode", "per-group")),
     }
     bad = [k for k in ("clip", "noise-multiplier", "lr", "value-clip") if dp[k] <= 0]
     if dp["rounds"] < 1:

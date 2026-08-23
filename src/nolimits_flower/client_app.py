@@ -80,7 +80,7 @@ def _dp_contribution(context: Context, config, theta):
     # preconditioning scale s (public, model-derived), so the noise is calibrated against
     # exactly the vector the optimizer uses.
     gradients = gradients * np.asarray(config["dp-precond"], dtype=float)[None, :]
-    if str(config.get("dp-clip-mode", "joint")) == "per-group":
+    if str(config.get("dp-clip-mode", "per-group")) == "per-group":
         # per-group clipping; bound is C_total = sqrt(sum C_g^2), noise isotropic at
         # sigma*C_total, so the accounting is identical to joint at C_total.
         group_ids = list(config["dp-group-ids"])

@@ -58,12 +58,12 @@ All are `--run-config` overrides; defaults are the defaults in `[tool.flwr.app.c
 | key | default | meaning |
 |---|---|---|
 | `dp` | `false` | master switch: turn the DP mechanism on |
-| `dp-clip` | `1.0` | per-subject gradient L2 clip norm `C` (the sensitivity bound) |
+| `dp-clip` | `20.0` | per-subject gradient L2 clip norm `C` (the sensitivity bound); a **public** hyperparameter tuned to the model — see [Choosing `dp-clip`](#choosing-dp-clip) |
 | `dp-noise-multiplier` | `1.0` | noise multiplier `σ`; Gaussian noise std added to the sum is `σ·C` |
 | `dp-rounds` | `50` | number of DP-Adam rounds `T` — this **is** the privacy budget (composition length) |
 | `dp-lr` | `0.05` | fixed Adam learning rate (no line search under noise) |
 | `dp-delta` | `1e-5` | target `δ` for the `(ε, δ)` report from the accountant |
-| `dp-clip-mode` | `joint` | `joint` (one clip over the whole gradient) or `per-group` (clip each parameter group separately) — see below |
+| `dp-clip-mode` | `per-group` | `per-group` (clip each parameter group separately — the default, preserves the variance components) or `joint` (one clip over the whole gradient) — see below |
 | `dp-final-value` | `false` | also privately release the final objective value (noised) for reporting |
 | `dp-value-clip` | `100.0` | clip on a subject's contribution to the objective value, when `dp-final-value` is on |
 | `dp-groups` | `""` | `per-group` only: `name:group,...` overrides for the group classifier |
@@ -109,9 +109,32 @@ Per-group buys unbiased variance components at **no extra budget**. (Noising per
 the demo does **not** do that.)
 
 !!! tip "Rule of thumb"
-    Use `dp-clip-mode="per-group"` whenever the variance components (`omega_*`) matter —
-    which for an NLME model is essentially always. `joint` is the simpler default and is fine
-    when only the structural parameters are of interest.
+    Keep the default `dp-clip-mode="per-group"` whenever the variance components (`omega_*`)
+    matter — which for an NLME model is essentially always. `joint` collapses the omegas out of
+    the box and is only worth choosing when *only* the structural parameters are of interest.
+
+## Choosing `dp-clip`
+
+`dp-clip` is a **public** hyperparameter — a fixed number you set and tune, exactly like
+`dp-lr`. It is **not** learned and must **never** be read off the private gradients or data:
+choosing `C` from the private per-subject norms would itself leak information and break the
+`(ε, δ)` guarantee. Pick it from public knowledge of the model's scale, then leave it fixed.
+
+The right size is the model's typical **per-subject gradient magnitude** on the preconditioned
+coordinate the optimizer steps in:
+
+- **Too small** → every subject's gradient saturates the clip, so the clip scales all of them
+  down toward zero; the small variance-component signal is lost first and the **omegas
+  collapse** even before noise is added. (This is what the old `dp-clip=1.0` default did to
+  warfarin, whose per-subject gradient norms run ~20+.)
+- **Too large** → the sensitivity `C` is bigger than it needs to be, so at a fixed `σ` the
+  Gaussian noise `σ·C` is larger than necessary and utility suffers.
+
+The default `dp-clip=20.0` suits this demo's **warfarin** model (the default `model`). Other
+models sit at different scales — a differently-parameterised or differently-preconditioned
+model may want a larger or smaller `C` — so retune it when you change the model. Combine it with
+the default `per-group` mode: per-group keeps each block's signal even when a single `C` is not
+a perfect fit for every block.
 
 ## A full DP run
 
@@ -132,10 +155,13 @@ actor so each site's DataModel is built once, in the prepare round (see
 DP writes a `results.json` (path from `results-path`) with a `dp` block alongside the fit.
 The `theta_natural` / `theta_transformed` fields are the DP-Adam optimum; nothing un-noised is
 reported — no per-site contribution, no objective trajectory, and no objective unless
-`dp-final-value` asked for one. A real (joint) block:
+`dp-final-value` asked for one. A real block from the **`theophylline`** model (note the
+theophylline scale — `v ≈ 0.46`, `cl ≈ 0.039`; a different model's numbers live at a different
+scale, so read the values against the model that produced them, not against warfarin):
 
 ```json
 {
+  "model": "theophylline",
   "theta_natural": { "ka": 1.53, "cl": 0.039, "v": 0.46, "omega_ka": 0.51, "...": "..." },
   "dp": {
     "enabled": true,
@@ -196,12 +222,15 @@ same accounting as joint at `C_total`, these values are exactly the ε both clip
     DP noise is calibrated to *one subject's* worst-case influence, but the demo's sites are
     tiny — 4 theophylline subjects per site, 1–2 orange trees, 8 warfarin. With so few
     subjects per site the clip removes a large fraction of the real signal and the noise
-    dominates, so a *usefully small* ε (say ε ≤ 10) will visibly degrade the estimates, and
-    the variance components suffer first (hence `per-group`). **DP at this scale is a
-    correctness and accounting demonstration, not a claim of good utility.** Real deployments
-    with hundreds to thousands of subjects per site are where a tight ε and usable estimates
-    coexist. This is why the DP path does not gate on the pooled-fit acceptance the non-DP
-    path uses: the noised optimum is not meant to match the exact pooled fit.
+    dominates, so utility degrades as ε tightens. With the defaults tuned for the model (a
+    `dp-clip` sized to its per-subject gradient magnitude and `per-group` clipping) a fit stays
+    **decent down to about ε ≈ 10 and gets poor below it**; the variance components suffer
+    first, which is exactly why `per-group` is the default. **DP at this scale is a correctness
+    and accounting demonstration, not a claim of good utility** — good utility needs a weaker ε
+    or larger cohorts. Real deployments with hundreds to thousands of subjects per site are
+    where a tight ε and usable estimates coexist. This is why the DP path does not gate on the
+    pooled-fit acceptance the non-DP path uses: the noised optimum is not meant to match the
+    exact pooled fit.
 
 ## SecAgg — deployment only
 

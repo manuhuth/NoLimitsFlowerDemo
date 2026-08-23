@@ -52,12 +52,17 @@ fail-site = -1  # testing only: make this site id raise in its handler
 # switches to fixed-schedule DP-Adam on per-subject-clipped, Gaussian-noised gradients and
 # writes results-path with the spent (eps, delta). See docs/differential-privacy.md.
 dp = false
-dp-clip = 1.0              # per-subject gradient L2 clip C (the sensitivity bound)
+dp-clip = 20.0             # per-subject gradient L2 clip C (the sensitivity bound). PUBLIC
+                          # hyperparameter: tune it to the model's per-subject gradient
+                          # magnitude, NEVER from the private data. Too small saturates every
+                          # subject and collapses the omegas; 20 suits the warfarin default.
 dp-noise-multiplier = 1.0 # sigma; Gaussian noise std on the summed gradient is sigma*C
 dp-rounds = 50            # DP-Adam rounds T - this IS the privacy budget (composition length)
 dp-lr = 0.05              # fixed Adam learning rate (no line search under noise)
 dp-delta = 1e-5          # target delta for the (eps, delta) report
-dp-clip-mode = "joint"   # "joint" (one clip over the whole gradient) or "per-group"
+dp-clip-mode = "per-group"  # "per-group" (recommended: clips each parameter group on its own,
+                            # so it preserves the variance components) or "joint" (one clip over
+                            # the whole gradient, which collapses the omegas). Same (eps, delta).
 dp-final-value = false   # also privately release the final (noised) objective for reporting
 dp-value-clip = 100.0    # per-subject clip on the objective value, when dp-final-value is on
 results-path = "results.json"  # where the dp fit writes its results + (eps, delta) block

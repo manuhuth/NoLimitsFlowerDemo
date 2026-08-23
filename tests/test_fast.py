@@ -322,7 +322,7 @@ def test_dp_options_rejects_pooled():
 
 def test_dp_options_defaults_and_types():
     dp = server_app._dp_options(_rc(), "laplace")
-    assert dp["clip"] == 1.0 and dp["rounds"] == 50 and dp["clip-mode"] == "joint"
+    assert dp["clip"] == 20.0 and dp["rounds"] == 50 and dp["clip-mode"] == "per-group"
     assert dp["delta"] == 1e-5
 
 
@@ -342,7 +342,8 @@ def test_dp_options_rejects_unknown_clip_mode():
 
 def test_dp_options_rejects_group_overrides_under_joint():
     with pytest.raises(ValueError, match="only apply when dp-clip-mode"):
-        server_app._dp_options(_rc(**{"dp-groups": "sigma:location"}), "laplace")
+        server_app._dp_options(
+            _rc(**{"dp-clip-mode": "joint", "dp-groups": "sigma:location"}), "laplace")
 
 
 def test_dp_options_parses_per_group_overrides():
