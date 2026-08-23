@@ -5,8 +5,8 @@ copyright: Code MIT. Bundled datasets keep their own licenses (see Models).
 
 theme:
   name: material
-  icon:
-    logo: material/flower-tulip
+  logo: assets/logo.png
+  favicon: assets/logo.png
   palette:
     - media: "(prefers-color-scheme: light)"
       scheme: default
