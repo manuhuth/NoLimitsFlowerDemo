@@ -127,6 +127,47 @@ end
 """
 
 # ----------------------------------------------------------------------------------
+# Model 5 - theophylline naive-pooled (NO random effects). The SAME 1-compartment oral
+# PK on the SAME real theoph data, but population fixed effects only, so it is the model
+# class the fixed-effects estimators MLE and MAP require. Weakly-informative LogNormal
+# priors on every fixed effect (evaluated on the natural scale) let the SAME model serve
+# both: MLE ignores the priors, MAP uses them. log-scaled coordinates keep ka/cl/v/sigma
+# positive without random effects to do it.
+# ----------------------------------------------------------------------------------
+THEOPH_POOLED_MODEL = """
+@fixedEffects begin
+    ka    = RealNumber(1.5, scale=:log, prior=LogNormal(log(1.5), 1.0))
+    cl    = RealNumber(0.04, scale=:log, prior=LogNormal(log(0.04), 1.0))
+    v     = RealNumber(0.5, scale=:log, prior=LogNormal(log(0.5), 1.0))
+    sigma = RealNumber(0.7, scale=:log, prior=LogNormal(log(0.7), 1.0))
+end
+
+@covariates begin
+    t    = Covariate()
+    Dose = ConstantCovariate(constant_on=:id)
+end
+
+@preDifferentialEquation begin
+    ke = cl / v
+end
+
+@DifferentialEquation begin
+    D(depot)   ~ -ka * depot
+    D(central) ~ ka * depot - ke * central
+end
+
+@initialDE begin
+    depot   = Dose
+    central = 0.0
+end
+
+@formulas begin
+    cp = central(t) / v
+    conc ~ Normal(cp, sigma)
+end
+"""
+
+# ----------------------------------------------------------------------------------
 # Model 3 - warfarin-nn (neural mixed effects on the SAME real warfarin data). The FFNN
 # `seed` is PINNED so every site builds identical initial weights: without it theta0
 # disagrees across sites and the prepare-round agreement check fails. 87 parameters
@@ -285,6 +326,29 @@ function nlf_dp_batches(dm, v, method)
     end
     (vals, grads, maxids)
 end
+
+# --- MLE / MAP (no random effects): per-INDIVIDUAL clipping unit ----------------------
+#
+# A no-RE model has no random-effect batch, so the DP clipping unit is the individual and
+# the per-subject term is the conditional log-likelihood (`objective_and_gradient(MLE(),
+# ctx, θ, idx)`). Summing the rows reproduces the population MLE gradient exactly. MAP's
+# extra term is the PUBLIC prior, added as an offset by the carrier (see map_prior); it
+# never enters this per-subject material, so MAP and MLE share this data path (maxids == 1).
+function nlf_mle_individuals(dm, v)
+    theta = nlf_natural(dm, v)
+    ctx = nlf_ctx(dm)
+    n = length(NoLimits.get_individuals(dm))
+    p = length(NoLimits.get_params(dm, scale = :transformed))
+    grads = Matrix{Float64}(undef, n, p)
+    vals = Vector{Float64}(undef, n)
+    for i in 1:n
+        val, g = NoLimits.objective_and_gradient(
+            NoLimits.MLE(), ctx, theta, i; scale = "transformed")
+        grads[i, :] .= Vector{Float64}(g)
+        vals[i] = Float64(val)
+    end
+    (vals, grads, 1)
+end
 """
 
 
@@ -380,6 +444,7 @@ class ModelSpec:
     param_tol: float = 1.0e-3   # worst natural-scale parameter tolerance for "strict"
     pooled_init: bool = False   # pass pooled_init=true to the pooled reference fit
     fit_seed: int = 0           # Random.seed!(fit_seed) before the pooled fit, 0 = none
+    probe_estimators: tuple = ()  # estimators the additivity probe checks; () = the default set
 
 
 CATALOG = {
@@ -401,6 +466,14 @@ CATALOG = {
         model=ORANGE_MODEL, loader=load_orange, primary_id="Tree", time_col="age",
         columns={"Tree": "Tree", "age": "age", "circumference": "circumference"},
         num_sites=3, pooled_init=True, param_tol=1.0e-3,
+    ),
+    # Naive-pooled theoph (no random effects): the model class MLE/MAP require. Reuses the
+    # theoph loader and column map. estimator="mle" default; the additivity probe checks
+    # mle and map (the RE estimators do not apply to a fixed-effects-only model).
+    "theoph-pooled": ModelSpec(
+        model=THEOPH_POOLED_MODEL, loader=load_theoph, primary_id="id", time_col="t",
+        columns={"Subject": "id", "Time": "t", "Dose": "Dose", "conc": "conc"},
+        num_sites=3, estimator="mle", probe_estimators=("mle", "map"),
     ),
 }
 
@@ -481,7 +554,11 @@ def _theta_for(nl, model, dm, source):
     return np.asarray(nl.seval("nlf_theta0")(dm), dtype=float)
 
 
+# Random-effect estimators (the additivity probe's default set for a mixed-effects model).
 ESTIMATORS = ("laplace", "focei", "ghq", "pooled")
+# Fixed-effects-only estimators: they REQUIRE a model with no random effects (theoph-pooled).
+FE_ESTIMATORS = ("mle", "map")
+ALL_ESTIMATORS = ESTIMATORS + FE_ESTIMATORS
 
 
 def _method(nl, estimator: str, ghq_level: int):
@@ -493,7 +570,38 @@ def _method(nl, estimator: str, ghq_level: int):
         return nl.GHQuadrature(level=ghq_level)
     if estimator == "pooled":
         return nl.Pooled()
-    raise ValueError(f"unknown estimator {estimator!r} (expected one of {ESTIMATORS})")
+    if estimator == "mle":
+        return nl.MLE()
+    if estimator == "map":
+        return nl.MAP()
+    raise ValueError(f"unknown estimator {estimator!r} (expected one of {ALL_ESTIMATORS})")
+
+
+# --- federated MAP prior-carrier rule -------------------------------------------------
+#
+# MAP's objective is [sum over subjects of loglik] + ONE shared log-prior. The server just
+# sums site payloads, so exactly ONE site must contribute the prior or it is counted S
+# times. Site index 0 is the deterministic prior carrier: it computes MAP (its sweep
+# includes the public prior), every other site computes MLE (loglik only). The naive server
+# sum is then the pooled MAP objective. MLE and every RE estimator are unaffected.
+def site_estimator(estimator: str, partition_id: int) -> str:
+    """The estimator this site actually runs: MAP on the carrier (site 0), else MLE."""
+    if estimator == "map" and int(partition_id) != 0:
+        return "mle"
+    return estimator
+
+
+def map_prior(nl, dm, theta_transformed):
+    """The PUBLIC MAP log-prior as (value, transformed-axes gradient).
+
+    prior = population MAP - population MLE at the same theta and scale; the log-likelihood
+    is computed identically in both sweeps and cancels, leaving exactly the log-prior. It is
+    data-independent, so under DP the carrier adds it as an un-clipped, un-noised offset and
+    it never enters the privacy accountant.
+    """
+    map_v, map_g = objective_and_gradient(nl, dm, theta_transformed, "map", 1, require_finite=False)
+    mle_v, mle_g = objective_and_gradient(nl, dm, theta_transformed, "mle", 1, require_finite=False)
+    return map_v - mle_v, map_g - mle_g
 
 
 # --- differential privacy --------------------------------------------------------------
@@ -640,9 +748,15 @@ def dp_batch_contributions(nl, dm, theta_transformed, estimator: str, ghq_level:
             "its plug-in random effects on the whole data set and has no per-subject form, "
             "so a per-subject clipping bound does not exist for it. Use laplace, focei or ghq."
         )
-    vals, grads, maxids = nl.seval("nlf_dp_batches")(
-        dm, np.asarray(theta_transformed, dtype=float), _method(nl, estimator, ghq_level)
-    )
+    theta = np.asarray(theta_transformed, dtype=float)
+    if estimator in FE_ESTIMATORS:
+        # No random effects: the clipping unit is the individual. MAP's data part is the
+        # per-individual MLE too (the prior is a separate public offset the carrier adds).
+        vals, grads, maxids = nl.seval("nlf_mle_individuals")(dm, theta)
+    else:
+        vals, grads, maxids = nl.seval("nlf_dp_batches")(
+            dm, theta, _method(nl, estimator, ghq_level)
+        )
     vals = np.asarray(vals, dtype=float)
     grads = np.atleast_2d(np.asarray(grads, dtype=float))
     if not np.all(np.isfinite(vals)) or not np.all(np.isfinite(grads)):
@@ -723,7 +837,8 @@ def additivity_probe(model: str = DEFAULT_MODEL, num_sites: int = 0, ghq_level: 
     """Per-estimator additivity: sum over sites of (value, gradient) vs the pooled-data call.
 
     One Julia boot, evaluated at the additivity-check theta (identical for every DataModel).
-    The neural model is checked for `laplace` only; the PK/growth models for all four.
+    The neural model is checked for `laplace` only; the PK/growth models for all four; the
+    naive-pooled model for `mle` and `map` (map through the site-0 prior-carrier rule).
     """
     import NoLimitsPy as nl
     sp = spec(model)
@@ -733,11 +848,17 @@ def additivity_probe(model: str = DEFAULT_MODEL, num_sites: int = 0, ghq_level: 
     pooled_dm = build_data_model(nl, model, df)
     site_dms = [build_data_model(nl, model, s) for s in partition(df, num_sites, sp.primary_id)]
     theta = _theta_for(nl, model, pooled_dm, source)
-    estimators = ("laplace",) if sp.acceptance == "nn" else ESTIMATORS
+    if sp.probe_estimators:
+        estimators = sp.probe_estimators
+    else:
+        estimators = ("laplace",) if sp.acceptance == "nn" else ESTIMATORS
     out = {}
     for estimator in estimators:
         pooled_value, pooled_grad = objective_and_gradient(nl, pooled_dm, theta, estimator, ghq_level)
-        pairs = [objective_and_gradient(nl, dm, theta, estimator, ghq_level) for dm in site_dms]
+        # Site i runs site_estimator(estimator, i): MAP only on the carrier (site 0), MLE
+        # elsewhere, so the summed payload is the pooled objective and gradient.
+        pairs = [objective_and_gradient(nl, dm, theta, site_estimator(estimator, i), ghq_level)
+                 for i, dm in enumerate(site_dms)]
         fed_value = sum(v for v, _ in pairs)
         fed_grad = np.sum([g for _, g in pairs], axis=0)
         out[estimator] = {

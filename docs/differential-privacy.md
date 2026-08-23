@@ -258,7 +258,10 @@ mechanism is SecAgg-ready.
     `@app.query` messages, so the SecAgg mod has nothing to wrap. The deployable version of
     this app adds the `secagg` switch and the masked round; DP, which is pure clipping + noise
     on the payload, needs none of that and runs here today. The `epsilon-per-site-vs-server`
-    field above quantifies exactly what SecAgg would remove.
+    field above quantifies exactly what SecAgg would remove. One note for `estimator="map"`
+    when SecAgg lands: the site-0 prior carrier's payload is larger than the others (it adds
+    the public prior), so the adaptive quantization range must be derived from the carrier's
+    true reported magnitudes, or the carrier's contribution clips.
 
 ## Roadmap position
 

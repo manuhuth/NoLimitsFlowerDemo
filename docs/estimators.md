@@ -145,8 +145,43 @@ federation error.
 data-independent plug-in (as `LogNormal` REs do here). It is exact when the plug-in `eta` is
 data-independent.
 
+## `mle` and `map` — fixed-effects-only (naive-pooled)
+
+```bash
+# MLE: maximum likelihood, priors ignored.
+flwr run . --stream --run-config 'model="theoph-pooled" estimator="mle"' \
+  --federation-config "num-supernodes=3 client-resources-num-cpus=3 init-args-num-cpus=3"
+
+# MAP: adds the fixed-effects log-priors.
+flwr run . --stream --run-config 'model="theoph-pooled" estimator="map"' \
+  --federation-config "num-supernodes=3 client-resources-num-cpus=3 init-args-num-cpus=3"
+```
+
+`MLE()` and `MAP()` fit a model with **no random effects** - population fixed effects plus a
+residual error only. They **require** such a model and error on a mixed-effects one, so they
+run on the dedicated `model="theoph-pooled"` (the same real theoph PK data and 1-compartment
+model as `theophylline`, but naive-pooled). `MLE` maximizes the log-likelihood; `MAP` adds the
+fixed effects' log-priors (weakly-informative `LogNormal` priors on `ka`, `cl`, `v`, `sigma`),
+so the **same** model serves both: `MLE` ignores the priors, `MAP` uses them. Both hit the
+strict acceptance (objective `1e-6`, parameters `1e-3`).
+
+**MLE is a pure per-subject sum**, so the federated sum is the pooled objective exactly, like
+the other estimators.
+
+!!! note "Federated MAP: the prior carrier"
+    MAP's objective is `[Σ over subjects loglik] + one shared log-prior`. The server just sums
+    the site payloads, so exactly **one** site must contribute the prior, or it is counted
+    once per site. The demo designates **site index 0** as the deterministic prior carrier: it
+    runs `MAP` (its sweep includes the prior), every other site runs `MLE` (log-likelihood
+    only). The naive server sum is then the pooled MAP objective, additive to machine precision
+    (`1.2e-16`). Under DP the prior is **public** (data-independent), so the carrier adds it as
+    an un-clipped, un-noised offset after the data aggregation; the prior never enters the
+    accountant, and `ε(map+dp) == ε(mle+dp)` at matched knobs.
+
+**Reach for them** when the model is fixed-effects-only (no between-subject random effects) and
+you want a point estimate: `mle` without priors, `map` with them.
+
 ## Not federated
 
 `SAEM` and `MCEM` are **not** federated: they need a per-site E-step sufficient-statistics
-primitive upstream in NoLimits. `MLE` and `MAP` have the protocol but require a model without
-random effects, which is not what this package is for.
+primitive upstream in NoLimits.

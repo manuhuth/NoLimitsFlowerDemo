@@ -8,8 +8,9 @@ from nolimits_flower import server_app, task
 
 # --- the 4-model catalog ----------------------------------------------------------
 
-def test_catalog_has_the_four_models():
-    assert set(task.CATALOG) == {"warfarin", "theophylline", "warfarin-nn", "orange"}
+def test_catalog_has_the_expected_models():
+    assert set(task.CATALOG) == {
+        "warfarin", "theophylline", "warfarin-nn", "orange", "theoph-pooled"}
 
 
 @pytest.mark.parametrize("model", list(task.CATALOG))
@@ -187,7 +188,7 @@ def test_agree_rejects_an_empty_prepare_round():
 
 # --- estimator selection / error parsing ------------------------------------------
 
-@pytest.mark.parametrize("bad", ["saem", "mcem", "mle", "", "Laplace"])
+@pytest.mark.parametrize("bad", ["saem", "mcem", "vi", "", "Laplace"])
 def test_unknown_estimator_is_rejected(bad):
     with pytest.raises(ValueError, match="unknown estimator"):
         task._method(nl=None, estimator=bad, ghq_level=5)
@@ -199,10 +200,25 @@ def test_known_estimators_reach_the_wrapper():
         FOCEI = staticmethod(lambda: "focei-method")
         GHQuadrature = staticmethod(lambda level: f"ghq-{level}")
         Pooled = staticmethod(lambda: "pooled-method")
+        MLE = staticmethod(lambda: "mle-method")
+        MAP = staticmethod(lambda: "map-method")
 
     assert task._method(FakeNl, "laplace", 5) == "laplace-method"
     assert task._method(FakeNl, "ghq", 7) == "ghq-7"
+    assert task._method(FakeNl, "mle", 5) == "mle-method"
+    assert task._method(FakeNl, "map", 5) == "map-method"
     assert set(task.ESTIMATORS) == {"laplace", "focei", "ghq", "pooled"}
+    assert set(task.FE_ESTIMATORS) == {"mle", "map"}
+
+
+def test_site_estimator_applies_the_prior_carrier_rule():
+    # MAP only on the carrier (site 0); MLE elsewhere; every other estimator is unchanged.
+    assert task.site_estimator("map", 0) == "map"
+    assert task.site_estimator("map", 1) == "mle"
+    assert task.site_estimator("map", 2) == "mle"
+    assert task.site_estimator("mle", 0) == "mle" and task.site_estimator("mle", 3) == "mle"
+    for est in ("laplace", "focei", "ghq", "pooled"):
+        assert task.site_estimator(est, 0) == est and task.site_estimator(est, 1) == est
 
 
 def test_short_reason_extracts_the_site_exception():

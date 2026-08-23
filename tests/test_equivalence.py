@@ -76,14 +76,15 @@ def _probe(model: str, timeout: float = 2400) -> dict:
 # --- additivity, ALWAYS, all four models (the exact-FL property) -------------------
 
 @pytest.mark.slow
-@pytest.mark.parametrize("model", ["theophylline", "orange",
+@pytest.mark.parametrize("model", ["theophylline", "orange", "theoph-pooled",
                                    pytest.param("warfarin", marks=warfarin_cached),
                                    pytest.param("warfarin-nn", marks=warfarin_cached)])
 def test_site_contributions_add_up(model):
     """Sum over sites of (value, gradient) == the pooled-data call, to 1e-8, per estimator.
 
     All estimators are per-subject sums, so this is exact regardless of the model (PK, ODE,
-    neural, or algebraic growth). The neural model checks `laplace` only."""
+    neural, or algebraic growth). The neural model checks `laplace` only; the naive-pooled
+    model checks `mle` and `map` (map summed through the site-0 prior-carrier rule)."""
     probes = _probe(model)["probes"]
     for name, p in probes.items():
         print(f"{model}/{name}: value_rel={p['value_rel']:.3e} gradient_rel={p['gradient_rel']:.3e}")
@@ -115,6 +116,18 @@ def test_theophylline_federated_fit_matches_pooled():
 def test_orange_federated_fit_matches_pooled():
     log = run_federated('model="orange"')
     assert "PASS:" in log, log[-4000:]
+
+
+# --- naive-pooled model: fixed-effects MLE and MAP (no random effects) -------------
+
+@pytest.mark.slow
+@pytest.mark.parametrize("estimator", ["mle", "map"])
+def test_theoph_pooled_federated_fit_matches_pooled(estimator):
+    """Federated MLE/MAP optimum == the single-process fit_model(dm, MLE()/MAP()) on the
+    naive-pooled theoph model. MAP sums through the site-0 prior carrier; the strict gate
+    (objective 1e-6, parameters 1e-3) lives in the ServerApp."""
+    log = run_federated(f'model="theoph-pooled" estimator="{estimator}"')
+    assert "PASS: federated optimum matches the pooled fit" in log, log[-4000:]
 
 
 # --- neural model: additivity gate + reported objective agreement (round-capped) ---
@@ -165,6 +178,53 @@ def test_dp_per_group_epsilon_equals_the_joint_equivalent(tmp_path):
     # Same sigma, rounds, delta -> the accountant returns the identical eps for both modes.
     assert per_group["epsilon"] == joint["epsilon"]
     assert per_group["epsilon"] == task.dp_epsilon(15, 0.5, 1e-5)
+
+
+def _dp_run_pooled(estimator: str, tmp_path, sigma=0.5, rounds=15) -> dict:
+    out = tmp_path / f"dp_pooled_{estimator}.json"
+    log = run_federated(
+        f'model="theoph-pooled" estimator="{estimator}" dp=true dp-noise-multiplier={sigma} '
+        f'dp-rounds={rounds} dp-clip-mode="joint" results-path="{out}"'
+    )
+    assert "PASS: DP federated fit complete" in log, log[-4000:]
+    return json.loads(out.read_text())
+
+
+@pytest.mark.slow
+def test_mle_map_dp_run_and_share_epsilon(tmp_path):
+    """mle+dp and map+dp both complete with the subject as the clipping unit, and spend the
+    SAME (eps, delta): the MAP prior is public, so it never enters the accountant."""
+    import math
+    mle = _dp_run_pooled("mle", tmp_path)["dp"]
+    mp = _dp_run_pooled("map", tmp_path)["dp"]
+    for dp in (mle, mp):
+        assert dp["enabled"] and dp["unit"] == "subject"
+        assert math.isfinite(dp["epsilon"]) and dp["epsilon"] > 0
+        assert dp["releases"] == 15 and dp["sites"] == 3
+    # eps(map+dp) == eps(mle+dp) at matched knobs, and both == the accountant's value.
+    assert mp["epsilon"] == mle["epsilon"] == task.dp_epsilon(15, 0.5, 1e-5)
+
+
+@pytest.mark.slow
+def test_dp_per_subject_leave_one_out_bounded_by_clip():
+    """The DP data part's add/remove-one-subject sensitivity is <= the clip bound: dropping
+    any one subject's per-individual gradient moves the clipped site sum by at most `clip`.
+    This is the MLE/MAP data path (MAP's prior is a separate public offset, added once)."""
+    import numpy as np
+    import NoLimitsPy as nl
+    dm = task.build_data_model(nl, "theoph-pooled",
+                               task.dataset("theoph-pooled", nl=nl))
+    theta0 = np.asarray(nl.seval("nlf_theta0")(dm), dtype=float)
+    mask = np.asarray(nl.seval("nlf_logmask")(dm), dtype=float)
+    s = task.precondition_scale(theta0, mask)
+    _, grads, maxids = task.dp_batch_contributions(nl, dm, theta0, "mle", 1)
+    assert maxids == 1, "each subject must be its own clipping unit for a no-RE model"
+    grads = grads * s[None, :]  # preconditioned coordinate the server clips in
+    clip = 20.0
+    full = task.dp_clip_sum(grads, clip)
+    for i in range(grads.shape[0]):
+        loo = task.dp_clip_sum(np.delete(grads, i, axis=0), clip)
+        assert np.linalg.norm(full - loo) <= clip + 1e-9, i
 
 
 @pytest.mark.slow

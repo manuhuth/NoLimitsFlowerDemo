@@ -65,21 +65,33 @@ def _dp_contribution(context: Context, config, theta):
 
     Nothing un-noised leaves this function, and nothing here is logged: the per-subject
     values and gradients it computes are the raw material the clipping bounds.
+
+    MAP under DP: the data part is the per-subject MLE (clipped and noised like any site); the
+    prior is PUBLIC and data-independent, so the carrier (site 0) adds it as an un-clipped,
+    un-noised offset AFTER the data aggregation. The prior never touches the accountant, so
+    eps(map+dp) == eps(mle+dp) at matched knobs.
     """
     dm = _site_dm(context)
+    estimator = str(config["estimator"])
+    site_id = int(context.node_config["partition-id"])
+    is_prior_carrier = estimator == "map" and site_id == 0
     values, gradients, _ = task.dp_batch_contributions(
-        nl, dm, theta, str(config["estimator"]), int(config["ghq-level"])
+        nl, dm, theta, estimator, int(config["ghq-level"])
     )
     sigma, sites = float(config["dp-noise-multiplier"]), int(config["dp-sites"])
     if str(config["dp-release"]) == "value":
         # The final objective, under its own per-subject clipping bound and budget charge.
         bound = float(config["dp-value-clip"])
         total = float(np.clip(values, -bound, bound).sum())
-        return np.array([total]) + task.dp_noise(1, bound, sigma, sites), bound
+        release = np.array([total]) + task.dp_noise(1, bound, sigma, sites)
+        if is_prior_carrier:
+            release = release + task.map_prior(nl, dm, theta)[0]  # public log-prior value
+        return release, bound
     # Clip in the coordinate the server's Adam steps in: transformed axes times the
     # preconditioning scale s (public, model-derived), so the noise is calibrated against
     # exactly the vector the optimizer uses.
-    gradients = gradients * np.asarray(config["dp-precond"], dtype=float)[None, :]
+    precond = np.asarray(config["dp-precond"], dtype=float)
+    gradients = gradients * precond[None, :]
     if str(config.get("dp-clip-mode", "per-group")) == "per-group":
         # per-group clipping; bound is C_total = sqrt(sum C_g^2), noise isotropic at
         # sigma*C_total, so the accounting is identical to joint at C_total.
@@ -91,6 +103,9 @@ def _dp_contribution(context: Context, config, theta):
         bound = float(config["dp-clip"])
         summed = task.dp_clip_sum(gradients, bound)
     noisy = summed + task.dp_noise(gradients.shape[1], bound, sigma, sites)
+    if is_prior_carrier:
+        # Public prior gradient, in the same preconditioned coordinate the data was clipped in.
+        noisy = noisy + task.map_prior(nl, dm, theta)[1] * precond
     return noisy, bound
 
 
@@ -157,6 +172,10 @@ def site_objective(msg: Message, context: Context) -> Message:
             }),
             reply_to=msg,
         )
+    # MAP prior-carrier rule: site 0 runs MAP (loglik + the shared prior), every other site
+    # runs MLE (loglik only), so the server's naive sum is the pooled MAP objective. MLE and
+    # the RE estimators are unaffected (site_estimator returns them unchanged).
+    estimator = task.site_estimator(str(config["estimator"]), site_id)
     # require_finite=False: a non-finite marginal at an optimizer probe theta is a legitimate
     # estimator result, so reply successfully with it and let the server backtrack on a finite
     # penalty. A genuine site error (a Julia solve that throws) still propagates and aborts.
@@ -164,7 +183,7 @@ def site_objective(msg: Message, context: Context) -> Message:
         nl,
         _site_dm(context),
         theta,
-        str(config["estimator"]),
+        estimator,
         int(config["ghq-level"]),
         require_finite=False,
     )

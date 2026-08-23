@@ -38,8 +38,9 @@ serverapp = "nolimits_flower.server_app:app"
 clientapp = "nolimits_flower.client_app:app"
 
 [tool.flwr.app.config]
-model = "warfarin"  # warfarin | theophylline | warfarin-nn | orange (see README Models)
-estimator = "laplace"
+model = "warfarin"  # warfarin | theophylline | warfarin-nn | orange | theoph-pooled (README Models)
+estimator = "laplace"  # laplace | focei | ghq | pooled (random-effects models) |
+                       # mle | map (naive-pooled model="theoph-pooled" only; no random effects)
 ghq-level = 1  # the level whose federated fit reliably converges to the pooled optimum on
                # this demo (levels 2-3 converge but to a rougher GHQ local optimum; see
                # docs/estimators.md). NoLimits' own numerically stable range is 1-3.
