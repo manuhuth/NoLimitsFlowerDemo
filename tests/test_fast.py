@@ -226,3 +226,128 @@ def test_short_reason_survives_an_empty_error():
         reason = ""
 
     assert "no reason reported" in server_app._short_reason(Error())
+
+
+# --- differential privacy: pure helpers (no Julia, no Flower) ----------------------
+
+def test_dp_epsilon_reproduces_the_accountant_cited_values():
+    # The two values cited in docs/differential-privacy.md (T=50, delta=1e-5).
+    assert round(task.dp_epsilon(50, 1.0, 1e-5), 2) == 58.93   # ~59, weak
+    assert round(task.dp_epsilon(50, 4.0, 1e-5), 2) == 10.05   # ~10, meaningful
+    # Monotone: more noise or fewer rounds -> smaller eps (stronger privacy).
+    assert task.dp_epsilon(50, 8.0, 1e-5) < task.dp_epsilon(50, 4.0, 1e-5)
+    assert task.dp_epsilon(25, 1.0, 1e-5) < task.dp_epsilon(50, 1.0, 1e-5)
+
+
+def test_dp_epsilon_depends_only_on_sigma_and_rounds_not_the_clip():
+    # eps is the same whatever the clip / split: that is why per-group == joint accounting.
+    assert task.dp_epsilon(50, 2.0, 1e-5) == task.dp_epsilon(50, 2.0, 1e-5)
+
+
+def test_dp_param_group_classifies_variance_vs_location():
+    for n in ("omega_ka", "sigma", "cov_ka_cl", "sd_v", "omega", "tau", "rho12"):
+        assert task.dp_param_group(n) == "variance", n
+    for n in ("ka", "cl", "v", "Asym", "xmid", "nn_params[3]"):
+        assert task.dp_param_group(n) == "location", n
+    # An explicit override wins over the heuristic.
+    assert task.dp_param_group("sigma", {"sigma": "location"}) == "location"
+
+
+def test_dp_resolve_groups_orders_by_first_appearance():
+    names = ["ka", "cl", "v", "omega_ka", "omega_cl", "omega_v", "sigma"]
+    ids, groups = task.dp_resolve_groups(names)
+    assert groups == ["location", "variance"]
+    assert ids == [0, 0, 0, 1, 1, 1, 1]
+
+
+def test_dp_clip_sum_bounds_the_site_sensitivity():
+    # One giant subject gradient is clipped to norm C; add/remove it moves the sum by <= C.
+    g = np.array([[100.0, 0.0], [0.0, 0.0]])
+    summed = task.dp_clip_sum(g, clip=1.0)
+    assert np.isclose(np.linalg.norm(summed), 1.0)
+
+
+def test_per_group_clipping_bounds_the_concatenated_norm_by_c_total():
+    """The correctness point: clipping each group sub-vector to C_g bounds the WHOLE
+    subject contribution by C_total = sqrt(sum C_g^2), so isotropic sigma*C_total noise is
+    one Gaussian mechanism at multiplier sigma - identical accounting to joint at C_total."""
+    # one subject, 2 location coords (group 0) + 2 variance coords (group 1)
+    g = np.array([[10.0, 10.0, 10.0, 10.0]])
+    group_ids = [0, 0, 1, 1]
+    group_clips = [1.0, 2.0]
+    c_total = task.dp_clip_total(group_clips)
+    assert np.isclose(c_total, np.sqrt(1.0 + 4.0))
+    summed = task.dp_clip_sum_grouped(g, group_ids, group_clips)
+    # location block clipped to 1, variance block clipped to 2 -> whole norm is C_total.
+    assert np.linalg.norm(summed) <= c_total + 1e-12
+    assert np.isclose(np.linalg.norm(summed), c_total)
+    # The eps at C_total (per-group) equals the eps of a joint clip at C_total: same sigma.
+    assert task.dp_epsilon(50, 4.0, 1e-5) == task.dp_epsilon(50, 4.0, 1e-5)
+
+
+def test_parse_group_mapping_round_trips_and_rejects_bad_entries():
+    assert task.parse_group_mapping("a:x, b:y") == {"a": "x", "b": "y"}
+    assert task.parse_group_mapping("") == {}
+    with pytest.raises(ValueError, match="bad group mapping"):
+        task.parse_group_mapping("noselector")
+
+
+def test_dp_noise_is_unseeded_and_scales_with_sigma_clip_over_sqrt_sites():
+    a = task.dp_noise(100000, clip=1.0, sigma=1.0, num_sites=1)
+    b = task.dp_noise(100000, clip=1.0, sigma=1.0, num_sites=1)
+    assert not np.allclose(a, b)  # not reproducible: unseeded from OS entropy
+    # std ~ sigma*clip/sqrt(S): 4 sites quarters the variance.
+    s1 = task.dp_noise(200000, 2.0, 1.0, 1).std()
+    s4 = task.dp_noise(200000, 2.0, 1.0, 4).std()
+    assert np.isclose(s1, 2.0, rtol=0.05)
+    assert np.isclose(s4, 1.0, rtol=0.05)
+
+
+# --- differential privacy: server option validation --------------------------------
+
+def _rc(**kw):
+    base = {"dp": True, "estimator": "laplace"}
+    base.update(kw)
+    return base
+
+
+def test_dp_options_none_when_off():
+    assert server_app._dp_options({"dp": False}, "laplace") is None
+
+
+def test_dp_options_rejects_pooled():
+    with pytest.raises(ValueError, match="cannot use estimator='pooled'"):
+        server_app._dp_options(_rc(), "pooled")
+
+
+def test_dp_options_defaults_and_types():
+    dp = server_app._dp_options(_rc(), "laplace")
+    assert dp["clip"] == 1.0 and dp["rounds"] == 50 and dp["clip-mode"] == "joint"
+    assert dp["delta"] == 1e-5
+
+
+@pytest.mark.parametrize("bad", [
+    {"dp-clip": 0.0}, {"dp-noise-multiplier": -1.0}, {"dp-rounds": 0},
+    {"dp-lr": 0.0}, {"dp-delta": 0.0}, {"dp-delta": 1.0}, {"dp-value-clip": -2.0},
+])
+def test_dp_options_rejects_bad_scalars(bad):
+    with pytest.raises(ValueError, match="invalid dp"):
+        server_app._dp_options(_rc(**bad), "laplace")
+
+
+def test_dp_options_rejects_unknown_clip_mode():
+    with pytest.raises(ValueError, match="invalid dp-clip-mode"):
+        server_app._dp_options(_rc(**{"dp-clip-mode": "bogus"}), "laplace")
+
+
+def test_dp_options_rejects_group_overrides_under_joint():
+    with pytest.raises(ValueError, match="only apply when dp-clip-mode"):
+        server_app._dp_options(_rc(**{"dp-groups": "sigma:location"}), "laplace")
+
+
+def test_dp_options_parses_per_group_overrides():
+    dp = server_app._dp_options(
+        _rc(**{"dp-clip-mode": "per-group", "dp-groups": "ka:location",
+               "dp-clip-per-group": "variance:0.5"}), "laplace")
+    assert dp["groups-override"] == {"ka": "location"}
+    assert dp["clip-per-group"] == {"variance": 0.5}

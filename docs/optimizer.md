@@ -126,4 +126,4 @@ comparison; a production deployment deletes it.
     The two summations in `federated` — `sum(...)` over site values and `np.sum(...)` over
     site gradients — are exactly what secure aggregation replaces: with SecAgg the server
     receives only the *sum*, never the per-site payloads, and the optimizer code is unchanged.
-    See [SecAgg composition](differential-privacy.md#secagg-composition).
+    See [SecAgg (deployment only)](differential-privacy.md#secagg-deployment-only).

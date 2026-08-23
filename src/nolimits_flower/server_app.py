@@ -24,7 +24,8 @@ import json
 import subprocess
 import sys
 import time
-from logging import ERROR, INFO
+from logging import ERROR, INFO, WARNING
+from pathlib import Path
 
 import numpy as np
 from flwr.app import ArrayRecord, ConfigRecord, Context, Message, RecordDict
@@ -154,8 +155,12 @@ def agree(sites: list[tuple]) -> tuple[list[str], np.ndarray, np.ndarray]:
     return list(names), np.asarray(theta0, dtype=float), np.asarray(mask, dtype=float)
 
 
-def prepare(grid: Grid, config: ConfigRecord) -> tuple[list[str], np.ndarray, np.ndarray]:
+def prepare(grid: Grid, config: ConfigRecord):
     """The prepare round: warm every site, log the setup table, source names/theta0.
+
+    Returns (names, theta0, log_mask, num_sites, biggest_batch); biggest_batch is the
+    largest number of subjects in any random-effect batch over all sites (dp only, 1
+    otherwise), i.e. whether the clipping unit really is the subject.
 
     ponytail: one message per node, no retries. In the SIMULATION runtime Ray actors are
     not pinned to a node, so an actor serving several partitions still builds the ones it
@@ -164,6 +169,7 @@ def prepare(grid: Grid, config: ConfigRecord) -> tuple[list[str], np.ndarray, np
     """
     replies = _send_all(grid, "query.prepare", {"config": config}, "prepare round")
     sites = []
+    biggest_batch = 1
     log(INFO, "PREPARE ROUND (%d sites)", len(replies))
     log(INFO, "  %-6s %9s %14s", "site", "subjects", "setup (s)")
     for reply in sorted(replies, key=lambda r: int(r.content["result"]["site-id"])):
@@ -172,6 +178,7 @@ def prepare(grid: Grid, config: ConfigRecord) -> tuple[list[str], np.ndarray, np
         _SITE_OF_NODE[reply.metadata.src_node_id] = site_id
         if not int(metrics["ready"]):
             raise SiteFailure(f"prepare round: site {site_id} did not report ready")
+        biggest_batch = max(biggest_batch, int(dict(metrics).get("max-batch-ids", 1)))
         log(INFO, "  %-6d %9d %14.1f", site_id, int(metrics["subjects"]),
             float(metrics["setup-seconds"]))
         sites.append((
@@ -180,7 +187,8 @@ def prepare(grid: Grid, config: ConfigRecord) -> tuple[list[str], np.ndarray, np
             reply.content["theta0"].to_numpy_ndarrays()[0],
             reply.content["log_mask"].to_numpy_ndarrays()[0],
         ))
-    return agree(sites)
+    names, x0, mask = agree(sites)
+    return names, x0, mask, len(sites), biggest_batch
 
 
 def broadcast(grid: Grid, theta: np.ndarray, config: ConfigRecord, rnd: int):
@@ -216,6 +224,204 @@ def main(grid: Grid, context: Context) -> None:
         raise SiteFailure(str(exc)) from None
 
 
+def _dp_options(run_config, estimator: str):
+    """The validated dp knobs, or None when `dp=false`. Pure function: unit-tested."""
+    if not bool(run_config.get("dp", False)):
+        return None
+    if estimator == "pooled":
+        raise ValueError(
+            "dp=true cannot use estimator='pooled': the naive-pooled objective calibrates "
+            "its plug-in random effects on the whole data set, so it has no per-subject term "
+            "to clip and no bounded sensitivity. Use laplace, focei or ghq."
+        )
+    dp = {
+        "clip": float(run_config.get("dp-clip", 1.0)),
+        "noise-multiplier": float(run_config.get("dp-noise-multiplier", 1.0)),
+        "rounds": int(run_config.get("dp-rounds", 50)),
+        "lr": float(run_config.get("dp-lr", 0.05)),
+        "delta": float(run_config.get("dp-delta", 1.0e-5)),
+        "final-value": bool(run_config.get("dp-final-value", False)),
+        "value-clip": float(run_config.get("dp-value-clip", 100.0)),
+        "clip-mode": str(run_config.get("dp-clip-mode", "joint")),
+    }
+    bad = [k for k in ("clip", "noise-multiplier", "lr", "value-clip") if dp[k] <= 0]
+    if dp["rounds"] < 1:
+        bad.append("rounds")
+    if not 0.0 < dp["delta"] < 1.0:
+        bad.append("delta")
+    if bad:
+        raise ValueError(
+            f"invalid dp settings {sorted('dp-' + k for k in bad)}: dp-clip, "
+            "dp-noise-multiplier, dp-lr and dp-value-clip must be positive, dp-rounds at "
+            "least 1, and dp-delta strictly between 0 and 1"
+        )
+    if dp["clip-mode"] not in ("joint", "per-group"):
+        raise ValueError(
+            f"invalid dp-clip-mode {dp['clip-mode']!r}: expected 'joint' or 'per-group'"
+        )
+    # Group resolution needs the parameter names, which only exist after prepare; here we
+    # only parse and validate the two string-encoded overrides.
+    dp["groups-override"] = task.parse_group_mapping(run_config.get("dp-groups", ""))
+    per_group = task.parse_group_mapping(run_config.get("dp-clip-per-group", ""))
+    dp["clip-per-group"] = {g: float(c) for g, c in per_group.items()}
+    if any(c <= 0 for c in dp["clip-per-group"].values()):
+        raise ValueError("dp-clip-per-group values must all be positive")
+    if dp["clip-mode"] == "joint" and (dp["groups-override"] or dp["clip-per-group"]):
+        raise ValueError(
+            "dp-groups and dp-clip-per-group only apply when dp-clip-mode='per-group'"
+        )
+    return dp
+
+
+def _run_dp(grid, context, config, dp, names, x0, mask, num_sites, biggest_batch):
+    """The DP fit: fixed-schedule Adam on per-subject-clipped, Gaussian-noised gradients.
+
+    Not L-BFGS: a line search re-evaluates the objective to test a step, which on a noisy
+    gradient is meaningless and a fresh budget charge, and the objective is not released
+    under dp at all. Adam spends exactly `dp-rounds` releases, which is what makes the
+    round count the budget knob; there is no convergence test since every gate-able
+    quantity is noisy. Writes results.json with the fit and the spent (eps, delta); nothing
+    un-noised is reported - no per-site contribution, no objective trajectory, and no
+    objective unless dp-final-value asked for one.
+    """
+    estimator = str(context.run_config["estimator"])
+    ghq_level = int(context.run_config["ghq-level"])
+    results_path = Path(str(context.run_config.get("results-path", "results.json"))).resolve()
+    s = task.precondition_scale(x0, mask)
+
+    # Per-group DP: resolve the coordinate->group split now that prepare reported the names,
+    # and log it once (group membership is model structure, not data). Everything downstream
+    # reduces to joint clipping at C_total = sqrt(sum C_g^2), the release's L2 sensitivity, so
+    # the accountant needs no per-group special-casing.
+    group_ids = group_names = group_clips = clip_total = None
+    if dp["clip-mode"] == "per-group":
+        group_ids, group_names = task.dp_resolve_groups(names, dp["groups-override"])
+        group_clips = task.dp_group_clips(group_names, dp["clip"], dp["clip-per-group"])
+        clip_total = task.dp_clip_total(group_clips)
+        members = {g: [n for n, i in zip(names, group_ids) if group_names[i] == g]
+                   for g in group_names}
+        log(INFO, "dp per-group clipping: %d groups, C_total=%.4g", len(group_names), clip_total)
+        for g, clip in zip(group_names, group_clips):
+            log(INFO, "  group %-10s clip=%.4g  params=%s", g, clip, members[g])
+        unmatched = task.dp_unmatched_group_names(names, dp["groups-override"])
+        if unmatched:
+            log(WARNING, "dp per-group: %s did not match a variance marker and defaulted to "
+                "'location'; set dp-groups to reclassify if wrong (does not affect the "
+                "privacy bound)", unmatched)
+
+    dp_unit = "subject" if biggest_batch <= 1 else (
+        f"random-effect batch (the grouping level; the largest batch holds {biggest_batch} "
+        "subjects, so add/remove-one applies to the batch, not the subject)"
+    )
+    log(INFO, "DIFFERENTIAL PRIVACY: %s estimator, %d sites, unit %s, clip-mode %s",
+        estimator, num_sites, dp_unit, dp["clip-mode"])
+
+    rounds = 0
+    slowest = 0.0
+    t0 = time.perf_counter()
+
+    def dp_release(theta: np.ndarray, release: str) -> np.ndarray:
+        """One dp round: the sum of the sites' CLIPPED, NOISED vectors, and nothing else."""
+        nonlocal rounds, slowest
+        rounds += 1
+        rnd = rounds
+        t_round = time.perf_counter()
+        group_cfg = ({"dp-group-ids": group_ids, "dp-group-clips": group_clips}
+                     if dp["clip-mode"] == "per-group" and release == "gradient" else {})
+        cfg = ConfigRecord({**dict(config.items()), "dp-sites": num_sites,
+                            "dp-release": release, "dp-precond": s.tolist(), **group_cfg})
+        replies = _send_all(grid, "query", {"theta": ArrayRecord([theta]), "config": cfg},
+                            f"round {rnd}")
+        vec = np.sum([r.content["release"].to_numpy_ndarrays()[0] for r in replies], axis=0)
+        if not np.all(np.isfinite(vec)):
+            raise SiteFailure(f"round {rnd}: non-finite dp release")
+        slowest = max(slowest, time.perf_counter() - t_round)
+        return vec
+
+    def dp_optimize() -> np.ndarray:
+        """Fixed-schedule Adam ascent in the preconditioned coordinate z (theta = x0 + s*z)."""
+        z = np.zeros_like(x0)
+        m = np.zeros_like(x0)
+        v = np.zeros_like(x0)
+        for t in range(1, dp["rounds"] + 1):
+            g = dp_release(x0 + s * z, "gradient")
+            m = 0.9 * m + 0.1 * g
+            v = 0.999 * v + 0.001 * g * g
+            z = z + dp["lr"] * (m / (1 - 0.9 ** t)) / (np.sqrt(v / (1 - 0.999 ** t)) + 1.0e-8)
+            log(INFO, "dp round %d/%d: |noisy grad|=%.3e", t, dp["rounds"], np.linalg.norm(g))
+        return z
+
+    z_star = dp_optimize()
+    theta_star = x0 + s * z_star
+    natural = task.to_natural(theta_star, mask)  # server has the log mask, needs no Julia
+    objective = float(dp_release(theta_star, "value")[0]) if dp["final-value"] else None
+    wall = time.perf_counter() - t0
+
+    releases = dp["rounds"] + (1 if dp["final-value"] else 0)
+    dp_block = {
+        "enabled": True,
+        "adjacency": task.DP_ADJACENCY,
+        "unit": dp_unit,
+        # eps depends only on the noise multiplier and round count: per-group clipping is
+        # exactly as private as joint at C_total, so the accountant is unchanged.
+        "epsilon": task.dp_epsilon(releases, dp["noise-multiplier"], dp["delta"]),
+        "delta": dp["delta"],
+        "releases": releases,
+        "sites": num_sites,
+        "clip-mode": dp["clip-mode"],
+        "noise": "distributed: each site adds N(0, (sigma*clip)^2 / sites)",
+        "clip": dp["clip"],
+        "noise-multiplier": dp["noise-multiplier"],
+        "rounds": dp["rounds"],
+        "lr": dp["lr"],
+        "final-value": dp["final-value"],
+        "value-clip": dp["value-clip"],
+        # Without SecAgg the server also sees each site's OWN noised release, carrying only
+        # its 1/S noise share: for that site's subjects, against the server, the budget is
+        # sqrt(S) larger. SecAgg (deployment only, see the DP docs) would close this.
+        "epsilon-per-site-vs-server": task.dp_epsilon(
+            releases, dp["noise-multiplier"] / np.sqrt(num_sites), dp["delta"]),
+    }
+    if dp["clip-mode"] == "per-group":
+        dp_block["groups"] = dict(zip(names, [group_names[i] for i in group_ids]))
+        dp_block["group-clips"] = dict(zip(group_names, group_clips))
+        dp_block["clip-total"] = clip_total
+
+    results = {
+        "converged": None,
+        "message": (f"fixed-schedule Adam, {dp['rounds']} dp rounds; no convergence test is "
+                    "possible on noisy gradients"),
+        "objective": objective,
+        "names": names,
+        "theta_natural": dict(zip(names, natural.tolist())),
+        "theta_transformed": dict(zip(names, theta_star.tolist())),
+        "config": {"model": str(context.run_config["model"]), "estimator": estimator,
+                   "ghq-level": ghq_level},
+        "rounds": rounds,
+        "timings": {"total-seconds": round(wall, 3), "slowest-round-seconds": round(slowest, 3)},
+        "dp": dp_block,
+    }
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    results_path.write_text(json.dumps(results, indent=2) + "\n")
+
+    log(INFO, "DP FEDERATED FIT (%s, %d sites, %d dp rounds)", estimator, num_sites, rounds)
+    if objective is None:
+        log(INFO, "  loglik=not released (dp)  wall=%.1fs", wall)
+    else:
+        log(INFO, "  loglik=%.10f (noised)  wall=%.1fs", objective, wall)
+    log(INFO, "  %-14s %16s %16s", "parameter", "natural", "transformed")
+    for name, nat, tr in zip(names, natural, theta_star):
+        log(INFO, "  %-14s %16.8g %16.8g", name, nat, tr)
+    log(INFO, "  DIFFERENTIAL PRIVACY ACTIVE: (eps=%.4g, delta=%.3g) spent over %d releases, "
+        "adjacency %s, unit %s", dp_block["epsilon"], dp["delta"], releases,
+        task.DP_ADJACENCY, dp_unit)
+    log(INFO, "  no per-site contribution, objective trajectory or un-noised quantity is "
+        "reported under dp")
+    log(INFO, "  results written to %s", results_path)
+    log(INFO, "PASS: DP federated fit complete (eps=%.4g at delta=%.3g)", dp_block["epsilon"],
+        dp["delta"])
+
+
 def _fit(grid: Grid, context: Context) -> None:
     model = str(context.run_config["model"])
     estimator = str(context.run_config["estimator"])
@@ -225,16 +431,28 @@ def _fit(grid: Grid, context: Context) -> None:
     max_rounds = int(context.run_config["max-rounds"])
     fail_site = int(context.run_config["fail-site"])
     acceptance = task.spec(model).acceptance
+    dp = _dp_options(context.run_config, estimator)
     if fail_site >= 0:
         log(INFO, "fault injection active (testing only): site %d will raise", fail_site)
-    config = ConfigRecord({"model": model, "estimator": estimator, "ghq-level": ghq_level})
+    # The "dp" flag and the scalar dp knobs travel in the wire config; the override dicts
+    # stay server-side (they only feed the group resolution below).
+    config = ConfigRecord({
+        "model": model, "estimator": estimator, "ghq-level": ghq_level,
+        "dp": dp is not None,
+        **({} if dp is None else {f"dp-{k}": v for k, v in dp.items()
+                                  if not isinstance(v, dict)}),
+    })
 
     # Prepare round: sites warm up and hand over the shared start point, the log mask (which
     # coordinates are log-scaled, so the server reports natural-scale numbers without Julia)
     # and the parameter names. No Julia on the server; every later round is a warm eval.
     t_prep = time.perf_counter()
-    names, x0, mask = prepare(grid, config)
+    names, x0, mask, num_sites, biggest_batch = prepare(grid, config)
     log(INFO, "prepare round wall=%.1fs", time.perf_counter() - t_prep)
+
+    if dp is not None:
+        _run_dp(grid, context, config, dp, names, x0, mask, num_sites, biggest_batch)
+        return
 
     # Neural model: the additivity of the site (value, gradient) IS the acceptance gate (the
     # headline exact-FL property), checked at theta0 by a self-contained child probe.

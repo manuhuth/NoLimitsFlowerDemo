@@ -60,6 +60,40 @@ def _site_dm(context: Context):
     return _site_dms[key]
 
 
+def _dp_contribution(context: Context, config, theta):
+    """This site's NOISED release for one dp round: (vector, its clipping bound).
+
+    Nothing un-noised leaves this function, and nothing here is logged: the per-subject
+    values and gradients it computes are the raw material the clipping bounds.
+    """
+    dm = _site_dm(context)
+    values, gradients, _ = task.dp_batch_contributions(
+        nl, dm, theta, str(config["estimator"]), int(config["ghq-level"])
+    )
+    sigma, sites = float(config["dp-noise-multiplier"]), int(config["dp-sites"])
+    if str(config["dp-release"]) == "value":
+        # The final objective, under its own per-subject clipping bound and budget charge.
+        bound = float(config["dp-value-clip"])
+        total = float(np.clip(values, -bound, bound).sum())
+        return np.array([total]) + task.dp_noise(1, bound, sigma, sites), bound
+    # Clip in the coordinate the server's Adam steps in: transformed axes times the
+    # preconditioning scale s (public, model-derived), so the noise is calibrated against
+    # exactly the vector the optimizer uses.
+    gradients = gradients * np.asarray(config["dp-precond"], dtype=float)[None, :]
+    if str(config.get("dp-clip-mode", "joint")) == "per-group":
+        # per-group clipping; bound is C_total = sqrt(sum C_g^2), noise isotropic at
+        # sigma*C_total, so the accounting is identical to joint at C_total.
+        group_ids = list(config["dp-group-ids"])
+        group_clips = list(config["dp-group-clips"])
+        bound = task.dp_clip_total(group_clips)
+        summed = task.dp_clip_sum_grouped(gradients, group_ids, group_clips)
+    else:
+        bound = float(config["dp-clip"])
+        summed = task.dp_clip_sum(gradients, bound)
+    noisy = summed + task.dp_noise(gradients.shape[1], bound, sigma, sites)
+    return noisy, bound
+
+
 @app.query("prepare")
 def prepare(msg: Message, context: Context) -> Message:
     """Warm this site: build the DataModel, burn one objective call, report theta0/names."""
@@ -70,8 +104,19 @@ def prepare(msg: Message, context: Context) -> Message:
     nl.seval("nlf_ctx")(dm)
     theta0 = np.asarray(nl.seval("nlf_theta0")(dm), dtype=float)
     log_mask = np.asarray(nl.seval("nlf_logmask")(dm), dtype=float)
-    # Discarded: its only job is to pay the first-call compilation cost here.
-    task.objective_and_gradient(nl, dm, theta0, str(config["estimator"]), int(config["ghq-level"]))
+    # Warm up the round path so its first-call compilation is paid here, not in round 1.
+    # Under dp that is the per-batch path, and it also reports whether the clip unit really
+    # is the subject (max batch ids == 1).
+    extra = {}
+    if bool(config["dp"]):
+        _, _, max_batch_ids = task.dp_batch_contributions(
+            nl, dm, theta0, str(config["estimator"]), int(config["ghq-level"])
+        )
+        extra["max-batch-ids"] = max_batch_ids
+    else:
+        task.objective_and_gradient(
+            nl, dm, theta0, str(config["estimator"]), int(config["ghq-level"])
+        )
     setup_seconds = time.perf_counter() - t0
     key = _site_key(context)
     log(INFO, "prepare: site %d ready in %.1fs", key[0], setup_seconds)
@@ -85,6 +130,7 @@ def prepare(msg: Message, context: Context) -> Message:
                 "site-id": key[0],
                 "subjects": _site_subjects[key],
                 "setup-seconds": setup_seconds,
+                **extra,
             }),
         }),
         reply_to=msg,
@@ -100,6 +146,17 @@ def site_objective(msg: Message, context: Context) -> Message:
     if site_id == int(context.run_config["fail-site"]):
         raise RuntimeError(f"fault injection: site {site_id} refuses to answer")
     theta = msg.content["theta"].to_numpy_ndarrays()[0]
+    if bool(config.get("dp", False)):
+        # Under dp the ONLY thing this site releases is the clipped, noised vector: no value
+        # and no per-site log-likelihood.
+        release, _ = _dp_contribution(context, config, theta)
+        return Message(
+            content=RecordDict({
+                "release": ArrayRecord([release]),
+                "result": MetricRecord({"site-id": site_id}),
+            }),
+            reply_to=msg,
+        )
     value, gradient = task.objective_and_gradient(
         nl,
         _site_dm(context),

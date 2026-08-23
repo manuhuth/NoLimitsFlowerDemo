@@ -42,6 +42,20 @@ data-seed = 20260818  # which simulated data set; ignored by data-source="warfar
 max-rounds = 100
 fail-site = -1  # testing only: make this site id raise in its handler
 
+# Differential privacy (subject-level). dp=false runs the exact L-BFGS-B fit above; dp=true
+# switches to fixed-schedule DP-Adam on per-subject-clipped, Gaussian-noised gradients and
+# writes results-path with the spent (eps, delta). See docs/differential-privacy.md.
+dp = false
+dp-clip = 1.0              # per-subject gradient L2 clip C (the sensitivity bound)
+dp-noise-multiplier = 1.0 # sigma; Gaussian noise std on the summed gradient is sigma*C
+dp-rounds = 50            # DP-Adam rounds T - this IS the privacy budget (composition length)
+dp-lr = 0.05              # fixed Adam learning rate (no line search under noise)
+dp-delta = 1e-5          # target delta for the (eps, delta) report
+dp-clip-mode = "joint"   # "joint" (one clip over the whole gradient) or "per-group"
+dp-final-value = false   # also privately release the final (noised) objective for reporting
+dp-value-clip = 100.0    # per-subject clip on the objective value, when dp-final-value is on
+results-path = "results.json"  # where the dp fit writes its results + (eps, delta) block
+
 [tool.pytest.ini_options]
 markers = [
     "slow: boots one Julia per site and fits (minutes)",

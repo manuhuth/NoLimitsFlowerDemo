@@ -18,6 +18,9 @@ client maps the wire vector back with the model's own inverse transform (all in 
 helper, `nlf_objgrad`).
 """
 
+import math
+import re
+import secrets
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -238,6 +241,50 @@ function nlf_objgrad(dm, v, method)
         method, nlf_ctx(dm), nlf_natural(dm, v), scale = "transformed")
     (Float64(val), Vector{Float64}(grad))
 end
+
+# --- differential privacy: the per-batch pairs the clipping needs --------------------
+#
+# A random-effect BATCH is NoLimits' independence unit (`build_re_batch_infos`): every
+# individual sharing a random-effect level lands in the same batch. With one ID-grouped
+# random effect - this demo's model class - a batch IS one subject and the returned
+# `maxids` (largest individuals in any batch) is 1. Laplace/FOCEI need the empirical-Bayes
+# mode once for all batches; GHQ integrates per batch and needs none; Pooled has no batch
+# form (rejected before reaching here). Gradients are on the transformed axes: the caller
+# scales each row by the preconditioning s and clips in that (optimizer) coordinate.
+nlf_bstars(method::Union{NoLimits.Laplace, NoLimits.FOCEI}, ctx, theta) =
+    NoLimits.empirical_bayes(ctx, theta)
+nlf_bstars(method, ctx, theta) = nothing
+
+nlf_batch_og(method::Union{NoLimits.Laplace, NoLimits.FOCEI}, ctx, theta, bi, bstars) =
+    NoLimits.objective_and_gradient(
+        method, ctx.dm, theta, NoLimits.get_batch_infos(ctx)[bi], bstars[bi];
+        const_cache = ctx.const_cache, cache = ctx.cache, scale = "transformed")
+
+nlf_batch_og(method::NoLimits.GHQuadrature, ctx, theta, bi, bstars) =
+    NoLimits.objective_and_gradient(
+        method, ctx.dm, theta, NoLimits.get_batch_infos(ctx)[bi];
+        const_cache = ctx.const_cache, cache = ctx.cache, scale = "transformed")
+
+# (per-batch values, per-batch transformed-axes gradients as rows, largest batch size).
+# Summing the rows reproduces nlf_objgrad's gradient exactly (the transform is linear in
+# the gradient, so it commutes with the sum over batches).
+function nlf_dp_batches(dm, v, method)
+    theta = nlf_natural(dm, v)
+    ctx = nlf_ctx(dm)
+    infos = NoLimits.get_batch_infos(ctx)
+    bstars = nlf_bstars(method, ctx, theta)
+    p = length(NoLimits.get_params(dm, scale = :transformed))
+    grads = Matrix{Float64}(undef, length(infos), p)
+    vals = Vector{Float64}(undef, length(infos))
+    maxids = 0
+    for bi in eachindex(infos)
+        val, g = nlf_batch_og(method, ctx, theta, bi, bstars)
+        grads[bi, :] .= Vector{Float64}(g)
+        vals[bi] = Float64(val)
+        maxids = max(maxids, length(infos[bi].inds))
+    end
+    (vals, grads, maxids)
+end
 """
 
 
@@ -447,6 +494,160 @@ def _method(nl, estimator: str, ghq_level: int):
     if estimator == "pooled":
         return nl.Pooled()
     raise ValueError(f"unknown estimator {estimator!r} (expected one of {ESTIMATORS})")
+
+
+# --- differential privacy --------------------------------------------------------------
+#
+# The mechanism: each site clips every SUBJECT's (preconditioned) gradient to L2 norm
+# <= `dp-clip`, so add/remove-one-subject moves the site sum by at most `dp-clip`; then
+# each of the S sites adds N(0, (sigma*clip)^2 / S) per coordinate, so the noise on the
+# federated sum is exactly N(0, (sigma*clip)^2) - the Gaussian mechanism at multiplier sigma.
+# The noise is DISTRIBUTED (each site adds its 1/S share) so it would compose with SecAgg.
+
+DP_ADJACENCY = "add/remove one subject"
+
+# NOT seeded: reproducible privacy noise is no privacy (holding the seed recovers the exact
+# clipped sum). One OS-entropy generator per process, so the per-round draws are one stream.
+DP_RNG = np.random.default_rng(secrets.randbits(128))
+
+# Substrings that mark a parameter as an RE SD/variance/covariance or the residual. Matched
+# token-wise on the lowercased name, so `omega_cl`, `sigma`, `cov_ka_cl` land in the variance
+# group and `cl`, `ka`, `v` in location. A false positive is fixed by a dp-groups override.
+DP_VARIANCE_MARKERS = ("omega", "sigma", "tau", "corr", "cov", "sd", "var", "rho")
+
+# Renyi-DP grid: fine below 10 (where the optimum sits for usable sigmas) and integral above.
+DP_ALPHAS = np.unique(np.concatenate([np.linspace(1.01, 10.0, 900), np.arange(10, 513)]))
+
+
+def dp_clip_sum(gradients, clip: float) -> np.ndarray:
+    """Per-subject L2 clipping, then the site sum. Sensitivity of the result is `clip`."""
+    gradients = np.atleast_2d(np.asarray(gradients, dtype=float))
+    norms = np.linalg.norm(gradients, axis=1)
+    factors = np.where(norms > clip, clip / np.maximum(norms, 1e-300), 1.0)
+    return (gradients * factors[:, None]).sum(axis=0)
+
+
+def dp_noise(shape, clip: float, sigma: float, num_sites: int) -> np.ndarray:
+    """This site's share of the distributed Gaussian noise: variance (sigma*clip)^2 / S."""
+    return DP_RNG.normal(0.0, sigma * clip / math.sqrt(num_sites), shape)
+
+
+# Per-group clipping bounds each subject's per-group sub-vector on its own, so a subject
+# atypical in the location coordinates does not eat the variance group's budget (the omega
+# collapse). It is EXACTLY as private as joint clipping at C_total = sqrt(sum_g C_g^2):
+# clipping subject i's group-g sub-vector to C_g bounds its whole L2 norm by C_total, so
+# add/remove-one moves the site sum by at most C_total. We add ISOTROPIC noise sigma*C_total
+# on every coordinate, so the release is one Gaussian mechanism at multiplier sigma - the
+# accountant is UNCHANGED whichever clip mode is in force.
+
+
+def dp_param_group(name: str, override: dict | None = None) -> str:
+    """The DP group of one parameter: an explicit override, else the name heuristic."""
+    override = override or {}
+    if name in override:
+        return str(override[name])
+    tokens = re.split(r"[^a-z0-9]+", name.lower())
+    is_var = any(t.startswith(m) for t in tokens if t for m in DP_VARIANCE_MARKERS)
+    return "variance" if is_var else "location"
+
+
+def dp_resolve_groups(names, override: dict | None = None):
+    """(group_ids, group_names): coordinate -> group index, and the ordered group names."""
+    labels = [dp_param_group(str(n), override) for n in names]
+    ordered = list(dict.fromkeys(labels))
+    index = {g: i for i, g in enumerate(ordered)}
+    return [index[l] for l in labels], ordered
+
+
+def dp_unmatched_group_names(names, override: dict | None = None):
+    """Names the heuristic did not match to a variance marker and that carry no override,
+    so they defaulted to 'location'. Membership never affects (eps, delta); this only flags
+    a possible misclassification the operator may want to correct with dp-groups."""
+    override = override or {}
+    out = []
+    for n in names:
+        n = str(n)
+        if n in override:
+            continue
+        tokens = re.split(r"[^a-z0-9]+", n.lower())
+        if not any(t.startswith(m) for t in tokens if t for m in DP_VARIANCE_MARKERS):
+            out.append(n)
+    return out
+
+
+def dp_group_clips(group_names, default_clip: float, per_group: dict | None = None):
+    """Per-group clip C_g aligned to `group_names`; `per_group` overrides the default."""
+    per_group = per_group or {}
+    return [float(per_group.get(g, default_clip)) for g in group_names]
+
+
+def dp_clip_total(group_clips) -> float:
+    """C_total = sqrt(sum_g C_g^2): the L2 sensitivity of the per-group clipped site sum."""
+    return float(math.sqrt(sum(c * c for c in group_clips)))
+
+
+def dp_clip_sum_grouped(gradients, group_ids, group_clips) -> np.ndarray:
+    """Per-subject, per-group L2 clipping, then the site sum. Each subject's sub-vector on
+    group g's coordinates is clipped to group_clips[g], so its whole contribution has L2
+    norm <= sqrt(sum_g C_g^2) = C_total."""
+    gradients = np.atleast_2d(np.asarray(gradients, dtype=float))
+    group_ids = np.asarray(group_ids, dtype=int)
+    out = gradients.copy()
+    for g, clip in enumerate(group_clips):
+        cols = group_ids == g
+        if not cols.any():
+            continue
+        block = gradients[:, cols]
+        norms = np.linalg.norm(block, axis=1)
+        factors = np.where(norms > clip, clip / np.maximum(norms, 1e-300), 1.0)
+        out[:, cols] = block * factors[:, None]
+    return out.sum(axis=0)
+
+
+def parse_group_mapping(text) -> dict[str, str]:
+    """Parse `a:x,b:y` run-config strings into {a: x, b: y}. Empty text -> {}."""
+    out: dict[str, str] = {}
+    for item in str(text).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        key, sep, value = item.partition(":")
+        if not sep:
+            raise ValueError(f"bad group mapping entry {item!r}: expected 'name:value'")
+        out[key.strip()] = value.strip()
+    return out
+
+
+def dp_epsilon(rounds: int, sigma: float, delta: float) -> float:
+    """(eps, delta) for `rounds` full-batch Gaussian releases at noise multiplier `sigma`.
+
+    One release is (alpha, alpha/(2 sigma^2))-RDP for every alpha > 1; RDP composes by
+    addition, so T rounds are (alpha, T*alpha/(2 sigma^2))-RDP; convert to (eps, delta) with
+    the standard tail bound and minimize over alpha.
+    """
+    eps = rounds * DP_ALPHAS / (2.0 * sigma**2) + math.log(1.0 / delta) / (DP_ALPHAS - 1.0)
+    return float(eps.min())
+
+
+def dp_batch_contributions(nl, dm, theta_transformed, estimator: str, ghq_level: int):
+    """(per-batch values, per-batch transformed-axes gradients, largest batch size).
+
+    Never leaves the site: the caller scales, clips and noises these before any release.
+    """
+    if estimator == "pooled":
+        raise ValueError(
+            "dp=true cannot use estimator='pooled': the naive-pooled objective calibrates "
+            "its plug-in random effects on the whole data set and has no per-subject form, "
+            "so a per-subject clipping bound does not exist for it. Use laplace, focei or ghq."
+        )
+    vals, grads, maxids = nl.seval("nlf_dp_batches")(
+        dm, np.asarray(theta_transformed, dtype=float), _method(nl, estimator, ghq_level)
+    )
+    vals = np.asarray(vals, dtype=float)
+    grads = np.atleast_2d(np.asarray(grads, dtype=float))
+    if not np.all(np.isfinite(vals)) or not np.all(np.isfinite(grads)):
+        raise RuntimeError("non-finite per-subject objective/gradient in a dp round")
+    return vals, grads, int(maxids)
 
 
 def objective_and_gradient(nl, dm, theta_transformed, estimator: str, ghq_level: int):

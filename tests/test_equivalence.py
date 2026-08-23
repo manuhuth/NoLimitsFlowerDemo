@@ -56,8 +56,8 @@ def run_federated(run_config: str, timeout: float = 1800.0) -> str:
         # Only TERMINAL outcomes end the poll. The NN additivity gate logs an early
         # "PASS: NN site contributions are additive" mid-run; matching a bare "PASS:"
         # would return before the fit's terminal "PASS: NN federation is exact".
-        if re.search(r"PASS: (?:federated|NN federation)|ABORTED|acceptance failed|"
-                     r"gate failed|Exit Code", log):
+        if re.search(r"PASS: (?:federated|NN federation|DP federated)|ABORTED|"
+                     r"acceptance failed|gate failed|Exit Code", log):
             return log
         time.sleep(10.0)
     raise AssertionError(f"run {run_id} did not finish within {timeout}s")
@@ -127,6 +127,44 @@ def test_warfarin_nn_additivity_gate_and_objective_agreement():
     log = run_federated('model="warfarin-nn" max-rounds=40', timeout=3000.0)
     assert "PASS: NN federation is exact" in log, log[-4000:]
     assert "NN objective agreement" in log
+
+
+def _dp_run(clip_mode: str, tmp_path, sigma=0.5, rounds=15) -> dict:
+    out = tmp_path / f"dp_{clip_mode}.json"
+    log = run_federated(
+        f'model="theophylline" dp=true dp-noise-multiplier={sigma} dp-rounds={rounds} '
+        f'dp-clip-mode="{clip_mode}" results-path="{out}"'
+    )
+    assert "PASS: DP federated fit complete" in log, log[-4000:]
+    return json.loads(out.read_text())
+
+
+@pytest.mark.slow
+def test_dp_fit_runs_and_reports_finite_epsilon(tmp_path):
+    """A DP run completes, writes a dp block with finite eps, and finite theta."""
+    res = _dp_run("joint", tmp_path)
+    dp = res["dp"]
+    assert dp["enabled"] and dp["unit"] == "subject" and dp["clip-mode"] == "joint"
+    import math
+    assert math.isfinite(dp["epsilon"]) and dp["epsilon"] > 0
+    assert dp["releases"] == 15 and dp["sites"] == 3
+    # The reported eps IS the accountant on (releases, sigma, delta).
+    assert abs(dp["epsilon"] - task.dp_epsilon(15, 0.5, 1e-5)) < 1e-9
+    assert all(math.isfinite(v) for v in res["theta_natural"].values())
+    # Nothing un-noised leaked: no objective (dp-final-value default off), no per-site block.
+    assert res["objective"] is None and "sites" not in res
+
+
+@pytest.mark.slow
+def test_dp_per_group_epsilon_equals_the_joint_equivalent(tmp_path):
+    """per-group at C_g with isotropic C_total noise == joint at C_total: same (eps, delta)."""
+    joint = _dp_run("joint", tmp_path)["dp"]
+    per_group = _dp_run("per-group", tmp_path)["dp"]
+    assert per_group["clip-mode"] == "per-group"
+    assert set(per_group["groups"].values()) == {"location", "variance"}
+    # Same sigma, rounds, delta -> the accountant returns the identical eps for both modes.
+    assert per_group["epsilon"] == joint["epsilon"]
+    assert per_group["epsilon"] == task.dp_epsilon(15, 0.5, 1e-5)
 
 
 @pytest.mark.slow
