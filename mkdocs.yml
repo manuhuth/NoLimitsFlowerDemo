@@ -1,0 +1,61 @@
+site_name: NoLimitsFlower
+site_description: Federated nonlinear mixed-effects estimation with NoLimits over Flower — a local-only showcase.
+site_author: manuhuth
+copyright: Code MIT. Bundled datasets keep their own licenses (see Models).
+
+theme:
+  name: material
+  icon:
+    logo: material/flower-tulip
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: pink
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: pink
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - content.code.copy
+    - content.code.annotate
+    - toc.follow
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.arithmatex:
+      generic: true
+
+extra_javascript:
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
+
+nav:
+  - Overview: index.md
+  - Models: models.md
+  - Estimators: estimators.md
+  - Differential privacy: differential-privacy.md
+  - Optimizer & scipy interface: optimizer.md
+  - Architecture: architecture.md
