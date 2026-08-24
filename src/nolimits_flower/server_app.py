@@ -130,6 +130,34 @@ def _send_all(grid: Grid, message_type: str, records: dict, label: str):
     return replies
 
 
+def _coordinator_node(grid: Grid) -> int:
+    """The node id of site 0, the deterministic coordinator (learned in the prepare round).
+
+    Falls back to the lowest node id before any reply named its site - only used after prepare
+    has populated the map, so the fallback is a defensive default, not the normal path.
+    """
+    for node, site in _SITE_OF_NODE.items():
+        if site == 0:
+            return node
+    return min(grid.get_node_ids())
+
+
+def _send_to(grid: Grid, node_id: int, message_type: str, records: dict, label: str):
+    """Send one message to a single node (the coordinator) and return its reply. Raises on a
+    missing or error reply, exactly like `_send_all`."""
+    message = Message(content=RecordDict(dict(records)), message_type=message_type,
+                      dst_node_id=node_id, group_id=label)
+    replies = list(grid.send_and_receive([message]))
+    if not replies:
+        raise SiteFailure(f"{label}: coordinator (site 0, node {node_id}) did not reply")
+    reply = replies[0]
+    if not reply.has_content():
+        raise SiteFailure(
+            f"{label}: coordinator (site 0, node {node_id}) failed: {_short_reason(reply.error)}"
+        )
+    return reply
+
+
 def agree(sites: list[tuple]) -> tuple[list[str], np.ndarray, np.ndarray]:
     """Collapse the sites' prepare replies to the (names, theta0, log_mask) they must share.
 
@@ -171,6 +199,7 @@ def prepare(grid: Grid, config: ConfigRecord):
     sites = []
     biggest_batch = 1
     mcem_parts = None
+    saem_parts = None
     log(INFO, "PREPARE ROUND (%d sites)", len(replies))
     log(INFO, "  %-6s %9s %14s", "site", "subjects", "setup (s)")
     for reply in sorted(replies, key=lambda r: int(r.content["result"]["site-id"])):
@@ -183,6 +212,10 @@ def prepare(grid: Grid, config: ConfigRecord):
         if "mcem" in reply.content:  # the q1/q2 M-step partition (same for every site)
             mcem_parts = ([str(n) for n in reply.content["mcem"]["q1"]],
                           [str(n) for n in reply.content["mcem"]["q2"]])
+        if "saem" in reply.content:  # closed-form/numerical + q1/q2 split (same for every site)
+            r = reply.content["saem"]
+            saem_parts = tuple([str(n) for n in r[f]]
+                               for f in ("closed_form", "numerical", "q1", "q2"))
         log(INFO, "  %-6d %9d %14.1f", site_id, int(metrics["subjects"]),
             float(metrics["setup-seconds"]))
         sites.append((
@@ -192,7 +225,7 @@ def prepare(grid: Grid, config: ConfigRecord):
             reply.content["log_mask"].to_numpy_ndarrays()[0],
         ))
     names, x0, mask = agree(sites)
-    return names, x0, mask, len(sites), biggest_batch, mcem_parts
+    return names, x0, mask, len(sites), biggest_batch, mcem_parts, saem_parts
 
 
 def broadcast(grid: Grid, theta: np.ndarray, config: ConfigRecord, rnd: int):
@@ -665,6 +698,140 @@ def _run_mcem_dp(grid, context, config, dp, names, x0, mask, num_sites, mcem_par
         dp["delta"])
 
 
+SAEM_PARAM_TOL = 5.0e-2  # Monte-Carlo tolerance: like MCEM, the per-site RNG partition differs
+# from the pooled run, so the two SAEM optima agree only up to sampling noise; the exact claim
+# is sufficient-stats additivity (the machine-precision test), this only checks the fit lands right.
+
+
+def _run_saem(grid, context, config, dp, names, x0, mask, num_sites, saem_parts):
+    """Nested federated SAEM (hybrid M-step). Per OUTER iteration: (1) a LOCAL E-step round
+    (reused from MCEM - each site samples its own subjects and caches the FIXED draws); (2) a
+    STATS round - each site returns its per-subject-additive sufficient statistics and the server
+    SUMS them in numpy (RE moments de-normalized, outcome/HMM plain sums); (3) a CLOSED-FORM
+    round on the COORDINATOR site (site 0) - it reconstructs the aggregated stats, runs the
+    STATEFUL closed-form update at this iteration's γ (threading the SA smoothed_state), and
+    returns the eligible params; (4) FEDERATED L-BFGS-B over the remaining NUMERICAL params
+    (the MCEM Q kernel). The server stays Julia-free: it only sums and runs scipy.
+
+    Fixed outer budget (task.SAEM_OUTER_ITERS == the pooled fit's maxiters). Acceptance is
+    parameter-wise vs fit_model(dm, SAEM()) at a Monte-Carlo tolerance; the exactness proof is
+    the sufficient-stats additivity test (tests/test_equivalence.py)."""
+    if saem_parts is None:
+        raise SiteFailure("SAEM: sites did not report the closed-form/numerical partition")
+    if dp is not None:
+        raise NotImplementedError("DP-SAEM is not wired yet (added in the DP stage)")
+    model = str(context.run_config["model"])
+    ghq_level = int(context.run_config["ghq-level"])
+    seed = int(context.run_config["data-seed"])
+    source = str(context.run_config["data-source"])
+    closed_form, numerical, q1_names, q2_names = saem_parts
+    # Each numerical param is optimized with the Q kernel of the part it lives in (q1 or q2).
+    num_by_part = [(p, [n for n in numerical if n in pn])
+                   for p, pn in (("q1", q1_names), ("q2", q2_names))]
+    outer_iters = task.SAEM_OUTER_ITERS
+    maxfun = task.SAEM_MSTEP_MAXFUN
+    s = task.precondition_scale(x0, mask)
+    theta = x0.copy()
+    rounds = 0
+    coord = _coordinator_node(grid)
+    t0 = time.perf_counter()
+    log(INFO, "NESTED FEDERATED SAEM: %d sites, %d outer iterations, %d samples/subject/E-step",
+        num_sites, outer_iters, task.SAEM_SAMPLE_SCHEDULE)
+    log(INFO, "  hybrid M-step: closed-form=%s (coordinator site 0)  numerical=%s (federated Q)",
+        closed_form, numerical)
+
+    def numerical_mstep(theta, part, free_names, k):
+        """Federated L-BFGS-B over one part's numerical coordinates at iteration k's draws."""
+        nonlocal rounds
+        if not free_names:
+            return theta
+        idxs = np.array([names.index(n) for n in free_names], dtype=int)
+        ss = s[idxs]
+        x_sub0 = theta[idxs].copy()
+        part_cfg = ConfigRecord({**dict(config.items()), "saem-phase": "numerical",
+                                 "saem-part": part, "saem-free-names": list(free_names),
+                                 "mcem-outer-iter": k})
+
+        def obj(z):
+            nonlocal rounds
+            cand = theta.copy()
+            cand[idxs] = x_sub0 + ss * np.asarray(z, dtype=float)
+            rounds += 1
+            sites = broadcast(grid, cand, part_cfg, rnd=rounds)
+            Q = sum(v for _, v, _ in sites)
+            g = np.sum([gg for _, _, gg in sites], axis=0)
+            if not np.isfinite(Q) or not np.all(np.isfinite(g)):
+                return 1.0e12, np.zeros_like(x_sub0)
+            return -Q, -(ss * g)
+
+        r = minimize(obj, np.zeros_like(x_sub0), method="L-BFGS-B", jac=True,
+                     options={"maxiter": maxfun, "maxfun": maxfun})
+        out = theta.copy()
+        out[idxs] = x_sub0 + ss * r.x
+        return out
+
+    for k in range(1, outer_iters + 1):
+        # (1) E-step: LOCAL, reuses the MCEM E-step + draw cache (mcem-* keys carry its params).
+        estep_cfg = ConfigRecord({**dict(config.items()), "saem-phase": "estep",
+                                  "mcem-outer-iter": k})
+        _send_all(grid, "query", {"theta": ArrayRecord([theta]), "config": estep_cfg},
+                  f"saem e-step {k}")
+        rounds += 1
+        # (2) Stats: each site's DE-NORMALIZED additive statistics; the server sums in numpy.
+        stats_cfg = ConfigRecord({**dict(config.items()), "saem-phase": "stats",
+                                  "mcem-outer-iter": k})
+        replies = _send_all(grid, "query", {"theta": ArrayRecord([theta]), "config": stats_cfg},
+                            f"saem stats {k}")
+        summed = np.sum([r.content["stats"].to_numpy_ndarrays()[0] for r in replies], axis=0)
+        rounds += 1
+        # (3) Closed-form M-step: the COORDINATOR re-normalizes and runs the stateful update.
+        cf_cfg = ConfigRecord({**dict(config.items()), "saem-phase": "closedform",
+                               "mcem-outer-iter": k})
+        cf = _send_to(grid, coord, "query",
+                      {"theta": ArrayRecord([theta]), "stats": ArrayRecord([summed]),
+                       "config": cf_cfg}, f"saem closed-form {k}")
+        for n, tv in zip([str(x) for x in cf.content["updates"]["names"]],
+                         [float(x) for x in cf.content["updates"]["values"]]):
+            theta[names.index(n)] = tv
+        rounds += 1
+        # (4) Numerical M-step over the non-closed-form params.
+        for part, fn in num_by_part:
+            theta = numerical_mstep(theta, part, fn, k)
+        nat = task.to_natural(theta, mask)
+        log(INFO, "  outer %2d/%d: %s", k, outer_iters,
+            {n: round(float(v), 5) for n, v in zip(names, nat)})
+    wall = time.perf_counter() - t0
+    fed_natural = task.to_natural(theta, mask)
+    log(INFO, "federated SAEM done: %d outer iterations, %d rounds, wall=%.1fs",
+        outer_iters, rounds, wall)
+
+    # DEMO ONLY: the pooled fit_model(dm, SAEM()) reference (seeded, same outer budget). A real
+    # deployment has no pooled data and deletes this. SAEM is stochastic, so params match only up
+    # to Monte-Carlo noise; the exactness proof is sufficient-stats additivity (the probe test).
+    ref = _child("fit", model, "saem", ghq_level, seed, source)
+    if ref["names"] != names:
+        raise RuntimeError(f"pooled reference order {ref['names']} != sites' {names}")
+    pooled_natural = np.asarray(ref["theta_natural"], dtype=float)
+    theta_rel = np.abs(fed_natural - pooled_natural) / np.maximum(np.abs(pooled_natural), 1e-12)
+
+    log(INFO, "ACCEPTANCE (federated SAEM vs pooled fit_model, model=%s data-source=%s)",
+        model, source)
+    log(INFO, "  %-8s %14s %14s %10s", "param", "federated", "pooled", "rel.diff")
+    for name, f, p, r in zip(names, fed_natural, pooled_natural, theta_rel):
+        log(INFO, "  %-8s %14.8f %14.8f %10.2e", name, f, p, r)
+    log(INFO, "  pooled Laplace-marginal loglik at its SAEM optimum: %.6f (quality yardstick)",
+        float(ref["value"]))
+    if theta_rel.max() >= SAEM_PARAM_TOL:
+        raise RuntimeError(
+            f"acceptance failed: worst SAEM parameter rel {theta_rel.max():.3e} "
+            f"(Monte-Carlo tol {SAEM_PARAM_TOL:.0e}) - raise task.SAEM_OUTER_ITERS or "
+            "task.SAEM_SAMPLE_SCHEDULE, or check the E-step seeding"
+        )
+    log(INFO, "PASS: federated SAEM matches the pooled fit (worst param %.2e, tol %.0e); "
+        "M-step exactness proven separately by sufficient-stats additivity",
+        theta_rel.max(), SAEM_PARAM_TOL)
+
+
 def _fit(grid: Grid, context: Context) -> None:
     model = str(context.run_config["model"])
     estimator = str(context.run_config["estimator"])
@@ -687,6 +854,12 @@ def _fit(grid: Grid, context: Context) -> None:
         **({"mcem-sample-schedule": task.MCEM_SAMPLE_SCHEDULE,
             "mcem-maxiters": task.MCEM_OUTER_ITERS, "mcem-seed": task.MCEM_SEED}
            if estimator == "mcem" else {}),
+        # SAEM reuses the MCEM E-step verbatim, so its sampler settings travel the same mcem-*
+        # keys; saem-maxiters (the fixed outer budget) is the coordinator's γ-schedule length.
+        **({"mcem-sample-schedule": task.SAEM_SAMPLE_SCHEDULE,
+            "mcem-maxiters": task.SAEM_OUTER_ITERS, "mcem-seed": task.SAEM_SEED,
+            "saem-maxiters": task.SAEM_OUTER_ITERS}
+           if estimator == "saem" else {}),
         **({} if dp is None else {f"dp-{k}": v for k, v in dp.items()
                                   if not isinstance(v, dict)}),
     })
@@ -695,11 +868,15 @@ def _fit(grid: Grid, context: Context) -> None:
     # coordinates are log-scaled, so the server reports natural-scale numbers without Julia)
     # and the parameter names. No Julia on the server; every later round is a warm eval.
     t_prep = time.perf_counter()
-    names, x0, mask, num_sites, biggest_batch, mcem_parts = prepare(grid, config)
+    names, x0, mask, num_sites, biggest_batch, mcem_parts, saem_parts = prepare(grid, config)
     log(INFO, "prepare round wall=%.1fs", time.perf_counter() - t_prep)
 
     if estimator == "mcem":
         _run_mcem(grid, context, config, dp, names, x0, mask, num_sites, mcem_parts)
+        return
+
+    if estimator == "saem":
+        _run_saem(grid, context, config, dp, names, x0, mask, num_sites, saem_parts)
         return
 
     if dp is not None:

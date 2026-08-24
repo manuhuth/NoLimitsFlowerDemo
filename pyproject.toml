@@ -41,8 +41,9 @@ clientapp = "nolimits_flower.client_app:app"
 model = "warfarin"  # warfarin | theophylline | warfarin-nn | orange | theoph-pooled (README Models)
 estimator = "laplace"  # laplace | focei | ghq | pooled (random-effects models) |
                        # mle | map (naive-pooled model="theoph-pooled" only; no random effects) |
-                       # mcem (nested EM: local E-step + federated M-step; needs a random-effects
-                       # model, e.g. warfarin/theophylline, NOT theoph-pooled; see docs/estimators.md)
+                       # mcem | saem (nested EM: local E-step + federated M-step; need a
+                       # random-effects model, e.g. warfarin/theophylline, NOT theoph-pooled;
+                       # SAEM adds a coordinator-site closed-form M-step; see docs/estimators.md)
 ghq-level = 1  # the level whose federated fit reliably converges to the pooled optimum on
                # this demo (levels 2-3 converge but to a rougher GHQ local optimum; see
                # docs/estimators.md). NoLimits' own numerically stable range is 1-3.

@@ -418,6 +418,126 @@ function nlf_mcem_dp_part(dm, v, draws, part, free_names)
     end
     (vals, grads)
 end
+
+# --- SAEM: nested federated EM (local E-step, federated closed-form + numerical M-step) -----
+#
+# SAEM reuses the MCEM E-step (`nlf_mcem_estep`) and the MCEM Q kernels (`nlf_mcem_q`) for the
+# NUMERICAL M-step. What is new is the CLOSED-FORM half: per iteration each site emits
+# per-subject-additive SAEM sufficient statistics (`saem_sufficient_statistics`), the server
+# SUMS them, and a COORDINATOR site runs the stateful closed-form update
+# (`saem_closed_form_mstep`, bit-identical to the fit). Sites emit the statistics DE-NORMALIZED
+# (RE moments as Σx=mean*n and Σxx'=second*n; outcome/HMM fields are already plain sums) so the
+# server aggregates with a single element-wise numpy sum, exactly like the MCEM gradient sum.
+
+# closed-form-eligible vs numerical free names PLUS the mcem q1/q2 split (so the driver knows
+# which Q part each numerical name lives in). All Strings, in the model's parameter order.
+function nlf_saem_parts(dm)
+    e = NoLimits.saem_closed_form_eligibility(dm)
+    p = NoLimits.mcem_q_partition(dm)
+    (closed_form = String.(e.closed_form), numerical = String.(e.numerical),
+        q1 = String.(p.q1), q2 = String.(p.q2))
+end
+
+_nlf_flat_push!(out, x::Number) = push!(out, Float64(x))
+_nlf_flat_push!(out, x::AbstractArray) = append!(out, Float64.(vec(x)))
+
+# Flatten the (re, outcome, hmm) stats to a Float64 vector of DE-NORMALIZED additive
+# quantities, in the deterministic key order. re: [Σx (d), vec(Σxx') (d*d), n]; outcome:
+# [s1, s2, ss, n]; hmm: [sum_w..., sum_wy...]. Identical layout on every site (same model),
+# so the server sums coordinate-wise; the coordinator re-normalizes on the way back in.
+function _nlf_saem_flatten(stats)
+    out = Float64[]
+    for re in keys(stats.re)
+        s = getfield(stats.re, re)
+        _nlf_flat_push!(out, s.mean .* s.n)
+        _nlf_flat_push!(out, s.second .* s.n)
+        _nlf_flat_push!(out, Float64(s.n))
+    end
+    for col in keys(stats.outcome)
+        s = getfield(stats.outcome, col)
+        _nlf_flat_push!(out, s.s1)
+        _nlf_flat_push!(out, s.s2)
+        _nlf_flat_push!(out, s.ss)
+        _nlf_flat_push!(out, Float64(s.n))
+    end
+    for col in keys(stats.hmm)
+        s = getfield(stats.hmm, col)
+        _nlf_flat_push!(out, s.sum_w)
+        _nlf_flat_push!(out, s.sum_wy)
+    end
+    out
+end
+
+# Rebuild aggregated stats from the server's summed flat vector, re-normalizing the RE moments
+# (mean = Σx/n, second = Σxx'/n). `template` gives the structure (families/keys/dims), which is
+# model-fixed and identical on every site.
+function _nlf_saem_unflatten(template, flat)
+    i = 0
+    re_pairs = Pair{Symbol, Any}[]
+    for re in keys(template.re)
+        s = getfield(template.re, re)
+        d = length(s.mean)
+        sx = flat[(i + 1):(i + d)]; i += d
+        sxx = reshape(flat[(i + 1):(i + d * d)], d, d); i += d * d
+        n = flat[i + 1]; i += 1
+        push!(re_pairs, re => (family = s.family, mean = sx ./ n, second = sxx ./ n, n = n))
+    end
+    out_pairs = Pair{Symbol, Any}[]
+    for col in keys(template.outcome)
+        s = getfield(template.outcome, col)
+        st = (family = s.family, s1 = flat[i + 1], s2 = flat[i + 2], ss = flat[i + 3], n = flat[i + 4])
+        i += 4
+        push!(out_pairs, col => st)
+    end
+    hmm_pairs = Pair{Symbol, Any}[]
+    for col in keys(template.hmm)
+        s = getfield(template.hmm, col)
+        lw = length(s.sum_w); lwy = length(s.sum_wy)
+        sw = lw == 1 ? flat[i + 1] : flat[(i + 1):(i + lw)]; i += lw
+        swy = lwy == 1 ? flat[i + 1] : flat[(i + 1):(i + lwy)]; i += lwy
+        push!(hmm_pairs, col => (family = s.family, target = s.target, sum_w = sw, sum_wy = swy))
+    end
+    (re = NamedTuple(re_pairs), outcome = NamedTuple(out_pairs), hmm = NamedTuple(hmm_pairs))
+end
+
+# This site's DE-NORMALIZED additive sufficient statistics over the FIXED draws (stats round).
+nlf_saem_stats_flat(dm, v, draws) =
+    _nlf_saem_flatten(NoLimits.saem_sufficient_statistics(dm, nlf_natural(dm, v), draws))
+
+# Per-subject (batch idx) form for the additivity proof: summing over idx == the population.
+nlf_saem_stats_flat_idx(dm, v, draws, idx) =
+    _nlf_saem_flatten(NoLimits.saem_sufficient_statistics(dm, nlf_natural(dm, v), draws, Int(idx)))
+
+# The demo SAEM method, shared by the pooled reference fit, the eligibility split and the
+# coordinator's γ schedule so all three agree. mstep_sa_on_params=false makes the pooled fit's
+# numerical M-step a plain maximization, matching the federated L-BFGS-B; convergence_window >
+# maxiters disables early stopping so the pooled fit runs the same fixed outer budget.
+nlf_saem_method(maxiters) = NoLimits.SAEM(
+    maxiters = Int(maxiters), sa_burnin_iters = 0, convergence_window = 50,
+    mstep_sa_on_params = false)
+
+# One COORDINATOR-side closed-form M-step from the server's summed flat stats. Reconstructs the
+# aggregated stats (template structure from the coordinator's own draws), computes γ from the
+# SAEM SA schedule at outer iteration `k`, runs the STATEFUL closed-form update, and returns the
+# eligible params on the TRANSFORMED (wire) scale + the smoothed_state to carry to iter k+1.
+# `smoothed_state === nothing` on k == 1. All demo closed-form params are scalar.
+function nlf_saem_mstep(dm, v, draws, summed_flat, smoothed_state, k, maxiters)
+    theta = nlf_natural(dm, v)
+    template = NoLimits.saem_sufficient_statistics(dm, theta, draws)
+    agg = _nlf_saem_unflatten(template, collect(Float64, summed_flat))
+    method = nlf_saem_method(maxiters)
+    γ = NoLimits._saem_gamma_schedule(Int(k), method.saem)
+    updates, new_state = NoLimits.saem_closed_form_mstep(
+        dm, agg, smoothed_state, theta, Float64(γ); method = method)
+    θ_nat = deepcopy(theta)
+    for name in keys(updates)
+        setproperty!(θ_nat, name, getproperty(updates, name))
+    end
+    θ_t = dm.model.fixed.transform(θ_nat)
+    names = String[String(n) for n in keys(updates)]
+    vals = Float64[Float64(getproperty(θ_t, n)) for n in keys(updates)]
+    (names, vals, new_state)
+end
 """
 
 
@@ -627,10 +747,12 @@ def _theta_for(nl, model, dm, source):
 ESTIMATORS = ("laplace", "focei", "ghq", "pooled")
 # Fixed-effects-only estimators: they REQUIRE a model with no random effects (theoph-pooled).
 FE_ESTIMATORS = ("mle", "map")
-# MCEM is a NESTED estimator (local E-step, federated M-step): it does not fit the single-shot
-# probe, so it is not in ESTIMATORS but is a valid run-config value on any RE model.
+# MCEM and SAEM are NESTED estimators (local E-step, federated M-step): they do not fit the
+# single-shot probe, so they are not in ESTIMATORS but are valid run-config values on any RE
+# model.
 MCEM_ESTIMATORS = ("mcem",)
-ALL_ESTIMATORS = ESTIMATORS + FE_ESTIMATORS + MCEM_ESTIMATORS
+SAEM_ESTIMATORS = ("saem",)
+ALL_ESTIMATORS = ESTIMATORS + FE_ESTIMATORS + MCEM_ESTIMATORS + SAEM_ESTIMATORS
 
 # MCEM demo settings, fixed (documented in docs/estimators.md). Kept in ONE place so the
 # federated outer loop, the sites' E-step, and the pooled reference fit all agree: the pooled
@@ -639,6 +761,16 @@ MCEM_SAMPLE_SCHEDULE = 100   # SaemixMH posterior draws per subject per E-step
 MCEM_OUTER_ITERS = 15        # fixed outer EM iterations (no convergence test; see docs)
 MCEM_MSTEP_MAXFUN = 12       # inner L-BFGS-B evals per M-step part (approximate M-step is fine)
 MCEM_SEED = 20260824         # base E-step seed; each site uses MCEM_SEED + site_id
+
+# SAEM demo settings, fixed. The E-step reuses the MCEM sampler (SaemixMH), so it travels the
+# mcem-* E-step keys on the wire. maxiters IS the fixed outer budget and also the pooled fit's
+# maxiters (see nlf_saem_method); the closed-form path converges fast, so fewer draws than MCEM
+# suffice. The pooled reference matches only up to Monte-Carlo noise (SAEM is stochastic and the
+# per-site RNG partition differs), so acceptance is parameter-wise at SAEM_PARAM_TOL.
+SAEM_SAMPLE_SCHEDULE = 50    # SaemixMH posterior draws per subject per E-step
+SAEM_OUTER_ITERS = 20        # fixed outer EM iterations == the pooled fit's maxiters
+SAEM_MSTEP_MAXFUN = 12       # inner L-BFGS-B evals per numerical M-step part
+SAEM_SEED = 20260824         # base E-step seed; each site uses SAEM_SEED + site_id
 
 
 def _method(nl, estimator: str, ghq_level: int):
@@ -656,6 +788,8 @@ def _method(nl, estimator: str, ghq_level: int):
         return nl.MAP()
     if estimator == "mcem":
         return nl.MCEM(sample_schedule=MCEM_SAMPLE_SCHEDULE, maxiters=MCEM_OUTER_ITERS)
+    if estimator == "saem":
+        return nl.seval("nlf_saem_method")(SAEM_OUTER_ITERS)
     raise ValueError(f"unknown estimator {estimator!r} (expected one of {ALL_ESTIMATORS})")
 
 
@@ -890,18 +1024,19 @@ def pooled_fit(model: str = DEFAULT_MODEL, estimator: str = "laplace", ghq_level
     import NoLimitsPy as nl
     sp = spec(model)
     dm = build_data_model(nl, model, dataset(model, source, seed, nl))
-    # MCEM is stochastic: seed the global RNG so the pooled reference is deterministic (and
-    # comparable to the seeded federated fit). Otherwise honor the model's fit_seed.
-    fit_seed = MCEM_SEED if estimator == "mcem" else sp.fit_seed
+    # MCEM/SAEM are stochastic: seed the global RNG so the pooled reference is deterministic
+    # (and comparable to the seeded federated fit). Otherwise honor the model's fit_seed.
+    fit_seed = MCEM_SEED if estimator == "mcem" else (
+        SAEM_SEED if estimator == "saem" else sp.fit_seed)
     if fit_seed:
         nl.seval("import Random")
         nl.seval("Random.seed!")(fit_seed)
     method = _method(nl, estimator, ghq_level)
     fit = nl.fit_model(dm, method, pooled_init=True) if sp.pooled_init else nl.fit_model(dm, method)
     theta = np.asarray(nl.seval("nlf_fit_theta")(fit), dtype=float)
-    # MCEM has no deterministic theta-objective (objective_and_gradient rejects it), so report
-    # the Laplace marginal loglik at the fitted theta as a deterministic quality yardstick.
-    value_estimator = "laplace" if estimator == "mcem" else estimator
+    # MCEM/SAEM have no deterministic theta-objective (objective_and_gradient rejects them), so
+    # report the Laplace marginal loglik at the fitted theta as a deterministic quality yardstick.
+    value_estimator = "laplace" if estimator in ("mcem", "saem") else estimator
     value, _ = objective_and_gradient(nl, dm, theta, value_estimator, ghq_level)
     names = [str(s) for s in nl.seval("nlf_names")(dm)]
     log_mask = np.asarray(nl.seval("nlf_logmask")(dm), dtype=float)
@@ -1005,8 +1140,40 @@ def mcem_additivity_probe(model: str = DEFAULT_MODEL, seed: int = DEFAULT_SEED,
     return {"model": model, "subjects": nb, "theta": theta0.tolist(), "probes": out}
 
 
+def saem_additivity_probe(model: str = DEFAULT_MODEL, seed: int = DEFAULT_SEED,
+                          source: str = DEFAULT_SOURCE):
+    """SAEM sufficient-statistics exactness: sum over subjects of the per-subject DE-NORMALIZED
+    additive statistics == the population statistics, to machine precision. This is the proof
+    that the server's numpy sum of the per-site payloads IS the pooled sufficient statistics.
+
+    One Julia boot. The draws come from a single E-step on the pooled DataModel; each batch is
+    one subject, so the per-idx sum equals summing whole sites (a site is a set of batches).
+    """
+    import NoLimitsPy as nl
+    dm = build_data_model(nl, model, dataset(model, source, seed, nl))
+    theta0 = np.asarray(nl.seval("nlf_theta0")(dm), dtype=float)
+    draws, _ = nl.seval("nlf_mcem_estep")(
+        dm, theta0, SAEM_SAMPLE_SCHEDULE, SAEM_OUTER_ITERS, SAEM_SEED, None
+    )
+    nb = int(len(draws))
+    pooled = np.asarray(nl.seval("nlf_saem_stats_flat")(dm, theta0, draws), dtype=float)
+    fed = np.zeros_like(pooled)
+    for i in range(1, nb + 1):
+        fed += np.asarray(
+            nl.seval("nlf_saem_stats_flat_idx")(dm, theta0, draws, i), dtype=float
+        )
+    parts = nl.seval("nlf_saem_parts")(dm)
+    return {
+        "model": model, "subjects": nb, "theta": theta0.tolist(),
+        "closed_form": [str(s) for s in parts.closed_form],
+        "numerical": [str(s) for s in parts.numerical],
+        "value_rel": float(np.max(np.abs(fed - pooled) / np.maximum(np.abs(pooled), 1e-12))),
+        "pooled": pooled.tolist(), "federated": fed.tolist(),
+    }
+
+
 if __name__ == "__main__":
-    # python -m nolimits_flower.task {fit|ref|probe|mcem-probe} <model> [estimator] [ghq] [seed] [source]
+    # python -m nolimits_flower.task {fit|ref|probe|mcem-probe|saem-probe} <model> [estimator] [ghq] [seed] [source]
     # -> one "POOLED_JSON {...}" line on stdout.
     import json
     import sys
@@ -1023,6 +1190,8 @@ if __name__ == "__main__":
         result = additivity_probe(model, 0, *rest[1:])
     elif mode == "mcem-probe":
         result = mcem_additivity_probe(model, rest[2], rest[3])
+    elif mode == "saem-probe":
+        result = saem_additivity_probe(model, rest[2], rest[3])
     elif mode == "fit":
         result = pooled_fit(model, *rest)
     else:
