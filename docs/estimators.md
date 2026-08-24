@@ -5,7 +5,8 @@ Four estimators are wired, all through the same protocol —
 (`task._method` maps the `estimator` string to the NoLimits method; `task.objective_and_gradient`
 calls it). Every one of them is a **sum over subjects**, so the summed site contributions are
 the pooled-data value and gradient **exactly**. Additivity (federated == pooled) holds for
-**all four**.
+**all four**. (`mle`/`map` federate the same way on the no-RE model; `mcem` is the one
+**nested** estimator - local E-step, federated M-step - documented at the end.)
 
 | `estimator` | NoLimits method | additivity of (value, gradient) | fit acceptance | per-round cost |
 |---|---|---|---|---|
@@ -181,7 +182,72 @@ the other estimators.
 **Reach for them** when the model is fixed-effects-only (no between-subject random effects) and
 you want a point estimate: `mle` without priors, `map` with them.
 
+## `mcem` — Monte-Carlo EM (nested: local E-step, federated M-step)
+
+```bash
+flwr run . --stream --run-config 'model="warfarin" data-source="simulated" estimator="mcem"' \
+  --federation-config "num-supernodes=3 client-resources-num-cpus=3 init-args-num-cpus=3"
+```
+
+MCEM is the one **nested** estimator. It does not go through the single-shot
+`objective_and_gradient` protocol above; there is no deterministic `theta`-objective to sum.
+Instead the server drives an outer EM loop, and each **outer iteration** is three federated
+rounds:
+
+1. **E-step (LOCAL).** The server broadcasts the current `theta`; each site runs
+   `mcem_e_step` over **its own subjects**, drawing `p(eta_i | y_i, theta)` per subject (the
+   `SaemixMH` sampler, 100 draws each). The draws and the sampler's warm-start state are
+   **cached in the site** (a module global, keyed by the outer-iteration index) and **held
+   fixed** for this iteration's M-step. Nothing about the draws ever leaves the site - the
+   E-step is not aggregated.
+2. **M-step over `q1` (FEDERATED).** The Monte-Carlo `Q(theta) = Σ_subject (1/M) Σ_m log
+   f(y_i, eta_i^m | theta)` at those fixed draws is a **per-subject sum**, so its value and
+   gradient federate exactly like the other estimators. The server runs a small L-BFGS-B over
+   the **`q1`** parameters (the observation-side ones - `ka`, `cl`, `v`, `sigma`); each
+   objective evaluation broadcasts a candidate `theta`, each site returns
+   `mcem_q_objective_and_gradient(part=:q1, …)` over its cached draws, and the server sums.
+3. **M-step over `q2` (FEDERATED).** The same, over the **`q2`** parameters (the
+   random-effect-distribution ones - `omega_ka`, `omega_cl`, `omega_v`). The `q1`/`q2` split
+   is `mcem_q_partition`; it mirrors the two independent maximizations `fit_model(dm, MCEM())`
+   does, and the sites report it in the prepare round.
+
+The server stays **Julia-free** - it only sums per-site `(value, gradient)` pairs and runs
+scipy, exactly the single-shot pattern, wrapped in the outer loop. A **fixed outer budget**
+(`task.MCEM_OUTER_ITERS`, 15) is used with no convergence test, and each inner M-step is
+capped at `task.MCEM_MSTEP_MAXFUN` evaluations - MCEM tolerates approximate M-steps. MCEM
+**requires random effects**, so it runs on `warfarin`/`theophylline`, **not** the no-RE
+`theoph-pooled`.
+
+**Exactness.** At fixed draws the federated M-step **is** the pooled M-step, to machine
+precision: summing the per-subject `Q` (value and gradient) reproduces the population `Q` at
+**0.0** relative error for both parts (`python -m nolimits_flower.task mcem-probe warfarin` /
+`tests/test_equivalence.py::test_mcem_q_additivity_at_fixed_draws`). This is the exactness
+proof. The end-to-end acceptance is **parameter-wise vs `fit_model(dm, MCEM())`** at a
+**Monte-Carlo** tolerance (`5e-2`): MCEM is stochastic and the per-site RNG partition differs
+from the pooled run, so the two optima agree only up to sampling noise (measured worst
+parameter `8.85e-3` on warfarin/simulated).
+
+!!! warning "DP-MCEM is the most privacy-expensive estimator"
+    Under `dp=true` each inner M-step becomes fixed-schedule **DP-Adam** on per-subject-clipped,
+    Gaussian-noised part gradients (the E-step still stays local; only the aggregated noised
+    gradient is released). But **DP composes over every Adam step across every outer
+    iteration**: the composition length is `outer × 2 parts × mcem-dp-mstep-steps`, and the
+    accountant counts **all** of them. On warfarin/simulated, `15 × 2 × 2 = 60` releases at
+    `σ=0.5`, `δ=1e-5` already spends `ε ≈ 194` (and `ε ≈ 489` for a site's own release against
+    the server without SecAgg). A single-shot estimator spends one release per round; MCEM
+    spends one per M-step gradient of every outer iteration, so its budget is far larger for a
+    comparable fit. Choose it under DP only with that in mind.
+
+    ```bash
+    flwr run . --stream --run-config \
+      'model="warfarin" data-source="simulated" estimator="mcem" dp=true dp-noise-multiplier=0.5 dp-clip-mode="joint" mcem-dp-mstep-steps=2' \
+      --federation-config "num-supernodes=3 client-resources-num-cpus=3 init-args-num-cpus=3"
+    ```
+
+**Reach for it** when you want a simulation-based (rather than Laplace-approximate) marginal
+likelihood and can afford the nested loop; avoid it under DP unless the large `ε` is acceptable.
+
 ## Not federated
 
-`SAEM` and `MCEM` are **not** federated: they need a per-site E-step sufficient-statistics
-primitive upstream in NoLimits.
+`SAEM` is **not** federated in this demo: although its closed-form M-step primitives exist
+upstream in NoLimits, the demo does not wire it.
