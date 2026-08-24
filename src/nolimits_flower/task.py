@@ -508,6 +508,15 @@ nlf_saem_stats_flat(dm, v, draws) =
 nlf_saem_stats_flat_idx(dm, v, draws, idx) =
     _nlf_saem_flatten(NoLimits.saem_sufficient_statistics(dm, nlf_natural(dm, v), draws, Int(idx)))
 
+# Per-subject DE-NORMALIZED flat rows (one per batch) for DP clipping: summing the rows == the
+# population `nlf_saem_stats_flat`, so the caller clips+noises each subject's row before release.
+function nlf_saem_stats_flat_rows(dm, v, draws)
+    theta = nlf_natural(dm, v)
+    n = length(draws)
+    rows = [_nlf_saem_flatten(NoLimits.saem_sufficient_statistics(dm, theta, draws, i)) for i in 1:n]
+    reduce(vcat, [reshape(r, 1, :) for r in rows])
+end
+
 # The demo SAEM method, shared by the pooled reference fit, the eligibility split and the
 # coordinator's γ schedule so all three agree. mstep_sa_on_params=false makes the pooled fit's
 # numerical M-step a plain maximization, matching the federated L-BFGS-B; convergence_window >

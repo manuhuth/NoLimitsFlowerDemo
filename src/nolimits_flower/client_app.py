@@ -230,6 +230,38 @@ def _saem_closedform(context: Context, config, summed_flat, theta):
     return [str(s) for s in names], np.asarray(vals, dtype=float)
 
 
+def _saem_dp_stats(context: Context, config, theta):
+    """This site's NOISED sufficient-statistics release for one outer iteration: per-subject
+    clip + distributed Gaussian noise on the DE-NORMALIZED flat rows, then the site sum. The DP
+    unit is the subject; nothing un-noised leaves this function. ponytail: JOINT clip over the
+    whole flat row - the RE-moment, outcome and count fields differ in magnitude, so a small
+    clip shrinks them all; per-field clipping is the upgrade if a useful private fit is needed."""
+    key = _site_key(context)
+    draws = _site_mcem_draws[(key, int(config["mcem-outer-iter"]))]
+    rows = np.atleast_2d(np.asarray(
+        nl.seval("nlf_saem_stats_flat_rows")(_site_dm(context), theta, draws), dtype=float))
+    clip = float(config["dp-clip"])
+    sigma, sites = float(config["dp-noise-multiplier"]), int(config["dp-sites"])
+    return task.dp_clip_sum(rows, clip) + task.dp_noise(rows.shape[1], clip, sigma, sites)
+
+
+def _saem_dp_contribution(context: Context, config, theta):
+    """This site's NOISED numerical M-step gradient for one DP-Adam step: per-subject clip +
+    noise on the part's gradient rows over `saem-free-names` (reuses the MCEM DP-part kernel).
+    Clipped in the preconditioned coordinate the server's Adam steps in."""
+    key = _site_key(context)
+    draws = _site_mcem_draws[(key, int(config["mcem-outer-iter"]))]
+    part = str(config["saem-part"])
+    fnames = [str(s) for s in config["saem-free-names"]]
+    _, grads = nl.seval("nlf_mcem_dp_part")(_site_dm(context), theta, draws, part, fnames)
+    grads = np.atleast_2d(np.asarray(grads, dtype=float))
+    precond = np.asarray(config["dp-precond"], dtype=float)
+    grads = grads * precond[None, :]
+    clip = float(config["dp-clip"])
+    sigma, sites = float(config["dp-noise-multiplier"]), int(config["dp-sites"])
+    return task.dp_clip_sum(grads, clip) + task.dp_noise(grads.shape[1], clip, sigma, sites)
+
+
 @app.query("prepare")
 def prepare(msg: Message, context: Context) -> Message:
     """Warm this site: build the DataModel, burn one objective call, report theta0/names."""
@@ -330,9 +362,12 @@ def site_objective(msg: Message, context: Context) -> Message:
                 reply_to=msg,
             )
         if sphase == "stats":
+            # Under dp the release is the per-subject-clipped, noised sufficient statistics.
+            stats = (_saem_dp_stats(context, config, theta) if bool(config.get("dp", False))
+                     else _saem_stats(context, config, theta))
             return Message(
                 content=RecordDict({
-                    "stats": ArrayRecord([_saem_stats(context, config, theta)]),
+                    "stats": ArrayRecord([stats]),
                     "result": MetricRecord({"site-id": site_id}),
                 }),
                 reply_to=msg,
@@ -348,6 +383,14 @@ def site_objective(msg: Message, context: Context) -> Message:
                 reply_to=msg,
             )
         if sphase == "numerical":
+            if bool(config.get("dp", False)):
+                return Message(
+                    content=RecordDict({
+                        "release": ArrayRecord([_saem_dp_contribution(context, config, theta)]),
+                        "result": MetricRecord({"site-id": site_id}),
+                    }),
+                    reply_to=msg,
+                )
             value, gradient = _saem_numerical(context, config, theta)
             return Message(
                 content=RecordDict({

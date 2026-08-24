@@ -719,7 +719,8 @@ def _run_saem(grid, context, config, dp, names, x0, mask, num_sites, saem_parts)
     if saem_parts is None:
         raise SiteFailure("SAEM: sites did not report the closed-form/numerical partition")
     if dp is not None:
-        raise NotImplementedError("DP-SAEM is not wired yet (added in the DP stage)")
+        _run_saem_dp(grid, context, config, dp, names, x0, mask, num_sites, saem_parts)
+        return
     model = str(context.run_config["model"])
     ghq_level = int(context.run_config["ghq-level"])
     seed = int(context.run_config["data-seed"])
@@ -830,6 +831,176 @@ def _run_saem(grid, context, config, dp, names, x0, mask, num_sites, saem_parts)
     log(INFO, "PASS: federated SAEM matches the pooled fit (worst param %.2e, tol %.0e); "
         "M-step exactness proven separately by sufficient-stats additivity",
         theta_rel.max(), SAEM_PARAM_TOL)
+
+
+def _run_saem_dp(grid, context, config, dp, names, x0, mask, num_sites, saem_parts):
+    """DP-SAEM. Per outer iteration: LOCAL E-step; a DP STATS release (each site clips+noises its
+    per-subject sufficient statistics, the server sums them); the COORDINATOR closed-form update
+    on the NOISED aggregated stats (post-processing, no extra release); and DP-Adam over the
+    NUMERICAL params (per-subject-clipped, noised part gradients), `mcem-dp-mstep-steps` releases
+    per numerical part. Composition length = outer x (1 stats + numerical-parts x steps).
+
+    HONEST NOTE: the closed-form params cost only the shared once-per-iteration stats release, so
+    for a model with few numerical params SAEM is CHEAPER than MCEM (which releases every Adam
+    step of both q-parts). The accountant counts every release; nothing un-noised is released."""
+    estimator = "saem"
+    ghq_level = int(context.run_config["ghq-level"])
+    results_path = Path(str(context.run_config.get("results-path", "results.json"))).resolve()
+    closed_form, numerical, q1_names, q2_names = saem_parts
+    num_by_part = [(p, [n for n in numerical if n in pn])
+                   for p, pn in (("q1", q1_names), ("q2", q2_names))]
+    active_parts = [(p, fn) for p, fn in num_by_part if fn]
+    outer_iters = task.SAEM_OUTER_ITERS
+    steps = int(context.run_config.get("mcem-dp-mstep-steps", 3))
+    if steps < 1:
+        raise ValueError("mcem-dp-mstep-steps must be >= 1")
+    s = task.precondition_scale(x0, mask)
+    theta = x0.copy()
+    coord = _coordinator_node(grid)
+    releases = 0
+    slowest = 0.0
+    t0 = time.perf_counter()
+
+    total_releases = outer_iters * (1 + len(active_parts) * steps)
+    log(INFO, "DP-SAEM: %d sites, %d outer iterations x (1 stats + %d numerical parts x %d "
+        "Adam steps) = %d releases, DP unit subject, JOINT clipping", num_sites, outer_iters,
+        len(active_parts), steps, total_releases)
+    log(WARNING, "DP-SAEM caveat: the stats release is once per outer iteration and the "
+        "closed-form params are post-processing of it, so SAEM is cheaper than MCEM per closed-"
+        "form param; the accountant below counts all %d releases", total_releases)
+
+    def dp_stats_release(cand_theta, k):
+        """One DP release: the server-summed, per-subject-clipped, noised sufficient stats."""
+        nonlocal releases, slowest
+        releases += 1
+        t_round = time.perf_counter()
+        cfg = ConfigRecord({**dict(config.items()), "saem-phase": "stats", "mcem-outer-iter": k,
+                            "dp-sites": num_sites})
+        replies = _send_all(grid, "query", {"theta": ArrayRecord([cand_theta]), "config": cfg},
+                            f"dp-saem stats {k}")
+        vec = np.sum([r.content["stats"].to_numpy_ndarrays()[0] for r in replies], axis=0)
+        if not np.all(np.isfinite(vec)):
+            raise SiteFailure(f"stats release {releases}: non-finite noised statistics")
+        slowest = max(slowest, time.perf_counter() - t_round)
+        return vec
+
+    def dp_gradient(cand_theta, part, free_names, part_precond, k):
+        """One DP release: the sum of the sites' clipped, noised numerical part gradients. Returns
+        the (possibly non-finite) vector - the caller reverts on non-finite rather than aborting."""
+        nonlocal releases, slowest
+        releases += 1
+        t_round = time.perf_counter()
+        cfg = ConfigRecord({**dict(config.items()), "saem-phase": "numerical", "saem-part": part,
+                            "saem-free-names": list(free_names), "mcem-outer-iter": k,
+                            "dp-sites": num_sites, "dp-precond": part_precond.tolist()})
+        replies = _send_all(grid, "query", {"theta": ArrayRecord([cand_theta]), "config": cfg},
+                            f"dp-saem release {releases}")
+        vec = np.sum([r.content["release"].to_numpy_ndarrays()[0] for r in replies], axis=0)
+        slowest = max(slowest, time.perf_counter() - t_round)
+        return vec
+
+    def adam_part(theta, part, free_names, k):
+        """Fixed-schedule Adam ascent over one numerical part's preconditioned coordinate z.
+
+        The identity-scaled structural params (ka/cl/v) can leave the ODE's domain under noisy
+        steps, where the Q gradient is non-finite. The non-DP path backtracks via L-BFGS-B; the
+        DP analog (no objective to line-search) is to REVERT to the last in-domain z and stop
+        this part's ascent. The release is still spent (privacy is charged whatever we do)."""
+        idxs = np.array([names.index(n) for n in free_names], dtype=int)
+        ss = s[idxs]
+        x_sub0 = theta[idxs].copy()
+        z = np.zeros_like(x_sub0)
+        z_good = z.copy()
+        m = np.zeros_like(z)
+        v = np.zeros_like(z)
+        for t in range(1, steps + 1):
+            cand = theta.copy()
+            cand[idxs] = x_sub0 + ss * z
+            g = dp_gradient(cand, part, free_names, ss, k)
+            if not np.all(np.isfinite(g)):  # this z left the domain: revert and stop
+                log(WARNING, "dp-saem outer %d part %s: non-finite gradient at a probe theta; "
+                    "reverting to the last in-domain step (privacy still spent)", k, part)
+                z = z_good
+                break
+            z_good = z.copy()
+            m = 0.9 * m + 0.1 * g
+            v = 0.999 * v + 0.001 * g * g
+            z = z + dp["lr"] * (m / (1 - 0.9 ** t)) / (np.sqrt(v / (1 - 0.999 ** t)) + 1.0e-8)
+        out = theta.copy()
+        out[idxs] = x_sub0 + ss * z
+        return out
+
+    for k in range(1, outer_iters + 1):
+        estep_cfg = ConfigRecord({**dict(config.items()), "saem-phase": "estep",
+                                  "mcem-outer-iter": k})
+        _send_all(grid, "query", {"theta": ArrayRecord([theta]), "config": estep_cfg},
+                  f"dp-saem e-step {k}")
+        # Closed-form params from the NOISED summed stats (coordinator is post-processing).
+        summed = dp_stats_release(theta, k)
+        cf_cfg = ConfigRecord({**dict(config.items()), "saem-phase": "closedform",
+                               "mcem-outer-iter": k})
+        cf = _send_to(grid, coord, "query",
+                      {"theta": ArrayRecord([theta]), "stats": ArrayRecord([summed]),
+                       "config": cf_cfg}, f"dp-saem closed-form {k}")
+        for n, tv in zip([str(x) for x in cf.content["updates"]["names"]],
+                         [float(x) for x in cf.content["updates"]["values"]]):
+            theta[names.index(n)] = tv
+        for part, fn in active_parts:
+            theta = adam_part(theta, part, fn, k)
+        log(INFO, "  dp-saem outer %2d/%d: %d releases so far", k, outer_iters, releases)
+    wall = time.perf_counter() - t0
+    natural = task.to_natural(theta, mask)
+
+    dp_block = {
+        "enabled": True,
+        "adjacency": task.DP_ADJACENCY,
+        "unit": "subject",
+        "epsilon": task.dp_epsilon(releases, dp["noise-multiplier"], dp["delta"]),
+        "delta": dp["delta"],
+        "releases": releases,
+        "sites": num_sites,
+        "clip-mode": "joint",
+        "noise": "distributed: each site adds N(0, (sigma*clip)^2 / sites)",
+        "clip": dp["clip"],
+        "noise-multiplier": dp["noise-multiplier"],
+        "outer-iterations": outer_iters,
+        "stats-releases": outer_iters,
+        "mstep-steps": steps,
+        "numerical-parts": [p for p, _ in active_parts],
+        "lr": dp["lr"],
+        "caveat": ("the once-per-iteration stats release covers all closed-form params, so DP-"
+                   "SAEM is cheaper per closed-form param than DP-MCEM; eps still grows with the "
+                   "numerical Adam steps"),
+        "epsilon-per-site-vs-server": task.dp_epsilon(
+            releases, dp["noise-multiplier"] / np.sqrt(num_sites), dp["delta"]),
+    }
+    results = {
+        "converged": None,
+        "message": (f"DP-SAEM: {outer_iters} outer iterations, {steps} DP-Adam steps per "
+                    "numerical M-step part; no convergence test on noisy gradients"),
+        "objective": None,
+        "names": names,
+        "theta_natural": dict(zip(names, natural.tolist())),
+        "theta_transformed": dict(zip(names, theta.tolist())),
+        "config": {"model": str(context.run_config["model"]), "estimator": estimator,
+                   "ghq-level": ghq_level},
+        "rounds": releases,
+        "timings": {"total-seconds": round(wall, 3), "slowest-round-seconds": round(slowest, 3)},
+        "dp": dp_block,
+    }
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    results_path.write_text(json.dumps(results, indent=2) + "\n")
+
+    log(INFO, "DP-SAEM FEDERATED FIT (%d sites, %d releases, wall=%.1fs)", num_sites, releases, wall)
+    log(INFO, "  %-14s %16s %16s", "parameter", "natural", "transformed")
+    for name, nat, tr in zip(names, natural, theta):
+        log(INFO, "  %-14s %16.8g %16.8g", name, nat, tr)
+    log(INFO, "  DIFFERENTIAL PRIVACY ACTIVE: (eps=%.4g, delta=%.3g) spent over %d releases "
+        "(%d stats + %d numerical), adjacency %s, unit subject", dp_block["epsilon"], dp["delta"],
+        releases, outer_iters, releases - outer_iters, task.DP_ADJACENCY)
+    log(INFO, "  results written to %s", results_path)
+    log(INFO, "PASS: DP federated fit complete (eps=%.4g at delta=%.3g)", dp_block["epsilon"],
+        dp["delta"])
 
 
 def _fit(grid: Grid, context: Context) -> None:

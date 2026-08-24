@@ -71,9 +71,9 @@ dp-final-value = false   # also privately release the final (noised) objective f
 dp-value-clip = 100.0    # per-subject clip on the objective value, when dp-final-value is on
 results-path = "results.json"  # where the dp fit writes its results + (eps, delta) block
 
-# MCEM + dp only: DP-Adam gradient releases per M-step part per outer iteration. The privacy
-# composition length is (MCEM outer iterations x 2 parts x this), so eps grows fast - MCEM is
-# the most privacy-expensive estimator. See docs/estimators.md.
+# MCEM/SAEM + dp only: DP-Adam gradient releases per numerical M-step part per outer iteration.
+# MCEM composition = outer x 2 parts x this; SAEM = outer x (1 stats release + numerical-parts x
+# this), cheaper because its closed-form params ride the shared stats release. See docs/estimators.md.
 mcem-dp-mstep-steps = 3
 
 [tool.pytest.ini_options]

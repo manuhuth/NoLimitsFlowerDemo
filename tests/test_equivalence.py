@@ -327,6 +327,38 @@ def test_saem_federated_fit_matches_pooled():
     assert "PASS: federated SAEM matches the pooled fit" in log, log[-4000:]
 
 
+def _saem_dp_run(tmp_path, sigma=0.5, steps=2) -> dict:
+    out = tmp_path / "dp_saem.json"
+    log = run_federated(
+        f'model="warfarin" data-source="simulated" estimator="saem" dp=true '
+        f'dp-noise-multiplier={sigma} dp-clip-mode="joint" mcem-dp-mstep-steps={steps} '
+        f'results-path="{out}"'
+    )
+    assert "PASS: DP federated fit complete" in log, log[-4000:]
+    return json.loads(out.read_text())
+
+
+@pytest.mark.slow
+def test_saem_dp_run_and_reports_finite_epsilon(tmp_path):
+    """DP-SAEM completes and writes a dp block whose eps is the accountant over EVERY release:
+    one sufficient-stats release per outer iteration PLUS the numerical DP-Adam steps. The
+    closed-form params ride the shared stats release (post-processing), so SAEM is cheaper per
+    closed-form param than MCEM. Nothing un-noised leaks (no objective, no per-site block)."""
+    import math
+    steps = 2
+    res = _saem_dp_run(tmp_path, steps=steps)
+    dp = res["dp"]
+    assert dp["enabled"] and dp["unit"] == "subject" and dp["clip-mode"] == "joint"
+    # warfarin: 1 numerical part (ka,cl,v in q1); releases = outer x (1 stats + 1 part x steps).
+    expected = task.SAEM_OUTER_ITERS * (1 + len(dp["numerical-parts"]) * steps)
+    assert dp["releases"] == expected, (dp["releases"], expected)
+    assert dp["stats-releases"] == task.SAEM_OUTER_ITERS
+    assert math.isfinite(dp["epsilon"]) and dp["epsilon"] > 0
+    assert abs(dp["epsilon"] - task.dp_epsilon(dp["releases"], 0.5, dp["delta"])) < 1e-9
+    assert all(math.isfinite(v) for v in res["theta_natural"].values())
+    assert res["objective"] is None and "sites" not in res
+
+
 @pytest.mark.slow
 def test_one_failing_site_aborts_the_run():
     """A site raising must abort, never yield a partial sum."""
