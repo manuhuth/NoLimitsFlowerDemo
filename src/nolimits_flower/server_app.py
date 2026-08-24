@@ -170,6 +170,7 @@ def prepare(grid: Grid, config: ConfigRecord):
     replies = _send_all(grid, "query.prepare", {"config": config}, "prepare round")
     sites = []
     biggest_batch = 1
+    mcem_parts = None
     log(INFO, "PREPARE ROUND (%d sites)", len(replies))
     log(INFO, "  %-6s %9s %14s", "site", "subjects", "setup (s)")
     for reply in sorted(replies, key=lambda r: int(r.content["result"]["site-id"])):
@@ -179,6 +180,9 @@ def prepare(grid: Grid, config: ConfigRecord):
         if not int(metrics["ready"]):
             raise SiteFailure(f"prepare round: site {site_id} did not report ready")
         biggest_batch = max(biggest_batch, int(dict(metrics).get("max-batch-ids", 1)))
+        if "mcem" in reply.content:  # the q1/q2 M-step partition (same for every site)
+            mcem_parts = ([str(n) for n in reply.content["mcem"]["q1"]],
+                          [str(n) for n in reply.content["mcem"]["q2"]])
         log(INFO, "  %-6d %9d %14.1f", site_id, int(metrics["subjects"]),
             float(metrics["setup-seconds"]))
         sites.append((
@@ -188,7 +192,7 @@ def prepare(grid: Grid, config: ConfigRecord):
             reply.content["log_mask"].to_numpy_ndarrays()[0],
         ))
     names, x0, mask = agree(sites)
-    return names, x0, mask, len(sites), biggest_batch
+    return names, x0, mask, len(sites), biggest_batch, mcem_parts
 
 
 def broadcast(grid: Grid, theta: np.ndarray, config: ConfigRecord, rnd: int):
@@ -423,6 +427,114 @@ def _run_dp(grid, context, config, dp, names, x0, mask, num_sites, biggest_batch
         dp["delta"])
 
 
+MCEM_PARAM_TOL = 5.0e-2  # Monte-Carlo tolerance: federated vs pooled draws differ (different
+# per-site RNG partition), so the two MCEM optima agree only up to sampling noise; the exact
+# claim is Q-additivity (the machine-precision test), this only checks the fit lands right.
+
+
+def _run_mcem(grid, context, config, dp, names, x0, mask, num_sites, mcem_parts):
+    """Nested federated MCEM. Per OUTER iteration: (1) a LOCAL E-step round - each site samples
+    its own subjects' posteriors and caches the FIXED draws; (2) a FEDERATED L-BFGS-B over the
+    q1 params and (3) another over the q2 params, each objective eval broadcasting a candidate
+    theta and summing the sites' per-part Q (value, gradient) at those fixed draws. The server
+    stays Julia-free: it only sums and runs scipy.
+
+    Fixed outer budget (task.MCEM_OUTER_ITERS); MCEM tolerates approximate M-steps, so each
+    inner L-BFGS-B is capped at task.MCEM_MSTEP_MAXFUN evals. Acceptance is parameter-wise vs
+    fit_model(dm, MCEM()) at a Monte-Carlo tolerance; the exactness proof is the Q-additivity
+    test (tests/test_mcem.py)."""
+    if mcem_parts is None:
+        raise SiteFailure("MCEM: sites did not report the q1/q2 partition in the prepare round")
+    if dp is not None:
+        _run_mcem_dp(grid, context, config, dp, names, x0, mask, num_sites, mcem_parts)
+        return
+    model = str(context.run_config["model"])
+    ghq_level = int(context.run_config["ghq-level"])
+    seed = int(context.run_config["data-seed"])
+    source = str(context.run_config["data-source"])
+    q1_names, q2_names = mcem_parts
+    q1i = np.array([names.index(n) for n in q1_names], dtype=int)
+    q2i = np.array([names.index(n) for n in q2_names], dtype=int)
+    outer_iters = task.MCEM_OUTER_ITERS
+    maxfun = task.MCEM_MSTEP_MAXFUN
+    s = task.precondition_scale(x0, mask)
+    theta = x0.copy()
+    rounds = 0
+    t0 = time.perf_counter()
+    log(INFO, "NESTED FEDERATED MCEM: %d sites, %d outer iterations, %d samples/subject/E-step",
+        num_sites, outer_iters, task.MCEM_SAMPLE_SCHEDULE)
+    log(INFO, "  M-step partition: q1(observation)=%s  q2(random-effects)=%s", q1_names, q2_names)
+
+    def mstep(theta, part, idxs, k):
+        """Federated L-BFGS-B over one part's coordinates at iteration k's fixed draws."""
+        nonlocal rounds
+        if idxs.size == 0:
+            return theta
+        ss = s[idxs]
+        x_sub0 = theta[idxs].copy()
+        part_cfg = ConfigRecord({**dict(config.items()), "mcem-phase": "mstep",
+                                 "mcem-part": part, "mcem-outer-iter": k})
+
+        def obj(z):
+            nonlocal rounds
+            cand = theta.copy()
+            cand[idxs] = x_sub0 + ss * np.asarray(z, dtype=float)
+            rounds += 1
+            sites = broadcast(grid, cand, part_cfg, rnd=rounds)
+            Q = sum(v for _, v, _ in sites)
+            g = np.sum([gg for _, _, gg in sites], axis=0)  # over the part's free axes only
+            if not np.isfinite(Q) or not np.all(np.isfinite(g)):
+                return 1.0e12, np.zeros_like(x_sub0)  # finite penalty so L-BFGS-B backtracks
+            return -Q, -(ss * g)
+
+        r = minimize(obj, np.zeros_like(x_sub0), method="L-BFGS-B", jac=True,
+                     options={"maxiter": maxfun, "maxfun": maxfun})
+        out = theta.copy()
+        out[idxs] = x_sub0 + ss * r.x
+        return out
+
+    for k in range(1, outer_iters + 1):
+        estep_cfg = ConfigRecord({**dict(config.items()), "mcem-phase": "estep",
+                                  "mcem-outer-iter": k})
+        _send_all(grid, "query", {"theta": ArrayRecord([theta]), "config": estep_cfg},
+                  f"mcem e-step {k}")
+        rounds += 1
+        theta = mstep(theta, "q1", q1i, k)
+        theta = mstep(theta, "q2", q2i, k)
+        nat = task.to_natural(theta, mask)
+        log(INFO, "  outer %2d/%d: %s", k, outer_iters,
+            {n: round(float(v), 5) for n, v in zip(names, nat)})
+    wall = time.perf_counter() - t0
+    fed_natural = task.to_natural(theta, mask)
+    log(INFO, "federated MCEM done: %d outer iterations, %d rounds, wall=%.1fs",
+        outer_iters, rounds, wall)
+
+    # DEMO ONLY: the pooled fit_model(dm, MCEM()) reference (seeded, same outer budget). A real
+    # deployment has no pooled data and deletes this. MCEM is stochastic, so params match only
+    # up to Monte-Carlo noise; the exactness proof is Q-additivity (tests/test_mcem.py).
+    ref = _child("fit", model, "mcem", ghq_level, seed, source)
+    if ref["names"] != names:
+        raise RuntimeError(f"pooled reference order {ref['names']} != sites' {names}")
+    pooled_natural = np.asarray(ref["theta_natural"], dtype=float)
+    theta_rel = np.abs(fed_natural - pooled_natural) / np.maximum(np.abs(pooled_natural), 1e-12)
+
+    log(INFO, "ACCEPTANCE (federated MCEM vs pooled fit_model, model=%s data-source=%s)",
+        model, source)
+    log(INFO, "  %-8s %14s %14s %10s", "param", "federated", "pooled", "rel.diff")
+    for name, f, p, r in zip(names, fed_natural, pooled_natural, theta_rel):
+        log(INFO, "  %-8s %14.8f %14.8f %10.2e", name, f, p, r)
+    log(INFO, "  pooled Laplace-marginal loglik at its MCEM optimum: %.6f (quality yardstick)",
+        float(ref["value"]))
+    if theta_rel.max() >= MCEM_PARAM_TOL:
+        raise RuntimeError(
+            f"acceptance failed: worst MCEM parameter rel {theta_rel.max():.3e} "
+            f"(Monte-Carlo tol {MCEM_PARAM_TOL:.0e}) - raise task.MCEM_OUTER_ITERS or "
+            "task.MCEM_SAMPLE_SCHEDULE, or check the E-step seeding"
+        )
+    log(INFO, "PASS: federated MCEM matches the pooled fit (worst param %.2e, tol %.0e); "
+        "M-step exactness proven separately by Q-additivity", theta_rel.max(), MCEM_PARAM_TOL)
+
+
 def _fit(grid: Grid, context: Context) -> None:
     model = str(context.run_config["model"])
     estimator = str(context.run_config["estimator"])
@@ -440,6 +552,11 @@ def _fit(grid: Grid, context: Context) -> None:
     config = ConfigRecord({
         "model": model, "estimator": estimator, "ghq-level": ghq_level,
         "dp": dp is not None,
+        # MCEM settings travel on the wire so the sites build the same method + seed and the
+        # server drives the same fixed outer-iteration budget as the pooled reference fit.
+        **({"mcem-sample-schedule": task.MCEM_SAMPLE_SCHEDULE,
+            "mcem-maxiters": task.MCEM_OUTER_ITERS, "mcem-seed": task.MCEM_SEED}
+           if estimator == "mcem" else {}),
         **({} if dp is None else {f"dp-{k}": v for k, v in dp.items()
                                   if not isinstance(v, dict)}),
     })
@@ -448,8 +565,12 @@ def _fit(grid: Grid, context: Context) -> None:
     # coordinates are log-scaled, so the server reports natural-scale numbers without Julia)
     # and the parameter names. No Julia on the server; every later round is a warm eval.
     t_prep = time.perf_counter()
-    names, x0, mask, num_sites, biggest_batch = prepare(grid, config)
+    names, x0, mask, num_sites, biggest_batch, mcem_parts = prepare(grid, config)
     log(INFO, "prepare round wall=%.1fs", time.perf_counter() - t_prep)
+
+    if estimator == "mcem":
+        _run_mcem(grid, context, config, dp, names, x0, mask, num_sites, mcem_parts)
+        return
 
     if dp is not None:
         _run_dp(grid, context, config, dp, names, x0, mask, num_sites, biggest_batch)

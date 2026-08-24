@@ -227,6 +227,41 @@ def test_dp_per_subject_leave_one_out_bounded_by_clip():
         assert np.linalg.norm(full - loo) <= clip + 1e-9, i
 
 
+# --- MCEM: nested federated EM (local E-step, federated M-step) --------------------
+
+def _mcem_probe(model: str, source: str = "simulated", timeout: float = 2400) -> dict:
+    proc = subprocess.run(
+        [sys.executable, "-m", "nolimits_flower.task", "mcem-probe", model, "mcem", "5",
+         "20260818", source],
+        cwd=REPO, capture_output=True, text=True, timeout=timeout,
+    )
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    line = next(l for l in proc.stdout.splitlines() if l.startswith("POOLED_JSON "))
+    return json.loads(line[len("POOLED_JSON "):])
+
+
+@pytest.mark.slow
+def test_mcem_q_additivity_at_fixed_draws():
+    """The EXACTNESS proof: at FIXED posterior draws, sum over subjects of the per-subject
+    M-step Q (value AND gradient) == the population Q, to machine precision, for both parts
+    (q1 observation-side, q2 random-effect distribution). This is why the federated M-step IS
+    the pooled M-step."""
+    probes = _mcem_probe("warfarin")["probes"]
+    assert set(probes) == {"q1", "q2"}, probes
+    for part, p in probes.items():
+        print(f"warfarin/{part}: value_rel={p['value_rel']:.3e} gradient_rel={p['gradient_rel']:.3e}")
+        assert p["value_rel"] < 1e-10, (part, p)
+        assert p["gradient_rel"] < 1e-10, (part, p)
+
+
+@pytest.mark.slow
+def test_mcem_federated_fit_matches_pooled():
+    """Nested federated MCEM (local E-step + federated M-step over q1 then q2) reproduces
+    fit_model(dm, MCEM()) to a Monte-Carlo tolerance; the ServerApp holds the gate."""
+    log = run_federated('model="warfarin" data-source="simulated" estimator="mcem"')
+    assert "PASS: federated MCEM matches the pooled fit" in log, log[-4000:]
+
+
 @pytest.mark.slow
 def test_one_failing_site_aborts_the_run():
     """A site raising must abort, never yield a partial sum."""

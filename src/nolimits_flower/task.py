@@ -349,6 +349,75 @@ function nlf_mle_individuals(dm, v)
     end
     (vals, grads, 1)
 end
+
+# --- MCEM: nested federated EM (local E-step, federated M-step) -----------------------
+#
+# The M-step Q(θ) = Σ_batch (1/M) Σ_m log f(y_b, η_b^m | θ) at FIXED posterior draws is a
+# per-subject sum, exactly like the single-shot objectives, so its value AND gradient are
+# federated-summable and per-subject-clippable. The E-step (`mcem_e_step`) is LOCAL: each
+# site samples its own subjects' posteriors and keeps the draws + warm-start state across the
+# M-step rounds of one outer iteration. `mcem_q_partition` splits the free fixed effects into
+# q1 (observation-side, needs the ODE) and q2 (RE-distribution only); the server optimizes
+# each with its own L-BFGS-B, summing the sites' per-part (value, gradient).
+import Random
+
+# q1/q2 names as Strings, in the model's parameter order (== nlf_names order for the demo's
+# all-scalar fixed effects), so the server can map each to a coordinate of the wire vector.
+function nlf_mcem_parts(dm)
+    p = NoLimits.mcem_q_partition(dm)
+    (q1 = String.(p.q1), q2 = String.(p.q2))
+end
+
+# One LOCAL E-step at the wire θ. `state === nothing` on outer iter 1 (prior-mean seeding);
+# thread `new_state` forward so warm-start + per-batch RNGs persist. The rng is seeded per
+# (site, run) so the fit is reproducible; draws are held FIXED for this iteration's M-step.
+function nlf_mcem_estep(dm, v, sample_schedule, maxiters, seed, state)
+    theta = nlf_natural(dm, v)
+    method = NoLimits.MCEM(sample_schedule = Int(sample_schedule), maxiters = Int(maxiters))
+    rng = Random.Xoshiro(UInt64(seed))
+    draws, new_state = NoLimits.mcem_e_step(dm, theta, method, state; rng = rng)
+    (draws, new_state)
+end
+
+# M-step Q value + transformed-axes gradient over the `part`'s free names at FIXED `draws`.
+# The gradient is on the `free_names` axes (frozen complement), so the server optimizes just
+# that sub-vector. Summing over sites reproduces the pooled Q (per-subject additive).
+function nlf_mcem_q(dm, v, draws, part, free_names)
+    theta = nlf_natural(dm, v)
+    Q, g = NoLimits.mcem_q_objective_and_gradient(
+        dm, theta, draws; part = Symbol(part),
+        free_names = Symbol.(collect(free_names)), scale = "transformed")
+    (Float64(Q), Vector{Float64}(g))
+end
+
+# Per-subject (batch idx) form for the additivity proof and DP clipping: summing over idx
+# equals the population `nlf_mcem_q` to machine precision.
+function nlf_mcem_q_idx(dm, v, draws, idx, part, free_names)
+    theta = nlf_natural(dm, v)
+    Q, g = NoLimits.mcem_q_objective_and_gradient(
+        dm, theta, draws, Int(idx); part = Symbol(part),
+        free_names = Symbol.(collect(free_names)), scale = "transformed")
+    (Float64(Q), Vector{Float64}(g))
+end
+
+# Per-subject rows for one M-step part (DP clipping unit == subject): (per-subject values,
+# per-subject transformed-axes gradients over the part's free axes). Summing the rows == the
+# population part; the caller clips + noises before any release.
+function nlf_mcem_dp_part(dm, v, draws, part, free_names)
+    theta = nlf_natural(dm, v)
+    fnames = Symbol.(collect(free_names))
+    n = length(draws)
+    p = length(fnames)
+    grads = Matrix{Float64}(undef, n, p)
+    vals = Vector{Float64}(undef, n)
+    for i in 1:n
+        Q, g = NoLimits.mcem_q_objective_and_gradient(
+            dm, theta, draws, i; part = Symbol(part), free_names = fnames, scale = "transformed")
+        grads[i, :] .= Vector{Float64}(g)
+        vals[i] = Float64(Q)
+    end
+    (vals, grads)
+end
 """
 
 
@@ -554,11 +623,22 @@ def _theta_for(nl, model, dm, source):
     return np.asarray(nl.seval("nlf_theta0")(dm), dtype=float)
 
 
-# Random-effect estimators (the additivity probe's default set for a mixed-effects model).
+# Random-effect estimators the SINGLE-SHOT (value, gradient) additivity probe checks.
 ESTIMATORS = ("laplace", "focei", "ghq", "pooled")
 # Fixed-effects-only estimators: they REQUIRE a model with no random effects (theoph-pooled).
 FE_ESTIMATORS = ("mle", "map")
-ALL_ESTIMATORS = ESTIMATORS + FE_ESTIMATORS
+# MCEM is a NESTED estimator (local E-step, federated M-step): it does not fit the single-shot
+# probe, so it is not in ESTIMATORS but is a valid run-config value on any RE model.
+MCEM_ESTIMATORS = ("mcem",)
+ALL_ESTIMATORS = ESTIMATORS + FE_ESTIMATORS + MCEM_ESTIMATORS
+
+# MCEM demo settings, fixed (documented in docs/estimators.md). Kept in ONE place so the
+# federated outer loop, the sites' E-step, and the pooled reference fit all agree: the pooled
+# fit's `maxiters` == the federated outer-iteration budget, and both seed the same way.
+MCEM_SAMPLE_SCHEDULE = 100   # SaemixMH posterior draws per subject per E-step
+MCEM_OUTER_ITERS = 15        # fixed outer EM iterations (no convergence test; see docs)
+MCEM_MSTEP_MAXFUN = 12       # inner L-BFGS-B evals per M-step part (approximate M-step is fine)
+MCEM_SEED = 20260824         # base E-step seed; each site uses MCEM_SEED + site_id
 
 
 def _method(nl, estimator: str, ghq_level: int):
@@ -574,6 +654,8 @@ def _method(nl, estimator: str, ghq_level: int):
         return nl.MLE()
     if estimator == "map":
         return nl.MAP()
+    if estimator == "mcem":
+        return nl.MCEM(sample_schedule=MCEM_SAMPLE_SCHEDULE, maxiters=MCEM_OUTER_ITERS)
     raise ValueError(f"unknown estimator {estimator!r} (expected one of {ALL_ESTIMATORS})")
 
 
@@ -808,13 +890,19 @@ def pooled_fit(model: str = DEFAULT_MODEL, estimator: str = "laplace", ghq_level
     import NoLimitsPy as nl
     sp = spec(model)
     dm = build_data_model(nl, model, dataset(model, source, seed, nl))
-    if sp.fit_seed:
+    # MCEM is stochastic: seed the global RNG so the pooled reference is deterministic (and
+    # comparable to the seeded federated fit). Otherwise honor the model's fit_seed.
+    fit_seed = MCEM_SEED if estimator == "mcem" else sp.fit_seed
+    if fit_seed:
         nl.seval("import Random")
-        nl.seval("Random.seed!")(sp.fit_seed)
+        nl.seval("Random.seed!")(fit_seed)
     method = _method(nl, estimator, ghq_level)
     fit = nl.fit_model(dm, method, pooled_init=True) if sp.pooled_init else nl.fit_model(dm, method)
     theta = np.asarray(nl.seval("nlf_fit_theta")(fit), dtype=float)
-    value, _ = objective_and_gradient(nl, dm, theta, estimator, ghq_level)
+    # MCEM has no deterministic theta-objective (objective_and_gradient rejects it), so report
+    # the Laplace marginal loglik at the fitted theta as a deterministic quality yardstick.
+    value_estimator = "laplace" if estimator == "mcem" else estimator
+    value, _ = objective_and_gradient(nl, dm, theta, value_estimator, ghq_level)
     names = [str(s) for s in nl.seval("nlf_names")(dm)]
     log_mask = np.asarray(nl.seval("nlf_logmask")(dm), dtype=float)
     natural = np.asarray(nl.seval("nlf_natural_vec")(dm, theta), dtype=float)
@@ -873,8 +961,52 @@ def additivity_probe(model: str = DEFAULT_MODEL, num_sites: int = 0, ghq_level: 
     return {"theta": theta.tolist(), "model": model, "sites": num_sites, "source": source, "probes": out}
 
 
+def mcem_additivity_probe(model: str = DEFAULT_MODEL, seed: int = DEFAULT_SEED,
+                          source: str = DEFAULT_SOURCE):
+    """MCEM M-step exactness: sum over subjects of the per-subject Q (value, gradient) at
+    FIXED draws == the population Q, for both parts (q1, q2). Machine-precision, so this is
+    the proof that the federated M-step IS the pooled M-step at the same draws.
+
+    One Julia boot. The draws come from a single E-step on the pooled DataModel; each batch is
+    one subject, so the per-idx sum equals summing whole sites (a site is a set of batches).
+    """
+    import NoLimitsPy as nl
+    dm = build_data_model(nl, model, dataset(model, source, seed, nl))
+    theta0 = np.asarray(nl.seval("nlf_theta0")(dm), dtype=float)
+    parts = nl.seval("nlf_mcem_parts")(dm)
+    part_names = {"q1": [str(s) for s in parts.q1], "q2": [str(s) for s in parts.q2]}
+    # One E-step (state=nothing) at theta0 to produce the fixed draws.
+    draws, _ = nl.seval("nlf_mcem_estep")(
+        dm, theta0, MCEM_SAMPLE_SCHEDULE, MCEM_OUTER_ITERS, MCEM_SEED, None
+    )
+    nb = int(len(draws))
+    out = {}
+    for part, fnames in part_names.items():
+        if not fnames:
+            continue
+        pooled_Q, pooled_g = nl.seval("nlf_mcem_q")(dm, theta0, draws, part, fnames)
+        pooled_Q = float(pooled_Q)
+        pooled_g = np.asarray(pooled_g, dtype=float)
+        fed_Q = 0.0
+        fed_g = np.zeros_like(pooled_g)
+        for i in range(1, nb + 1):
+            Qi, gi = nl.seval("nlf_mcem_q_idx")(dm, theta0, draws, i, part, fnames)
+            fed_Q += float(Qi)
+            fed_g += np.asarray(gi, dtype=float)
+        out[part] = {
+            "names": fnames,
+            "pooled_value": pooled_Q,
+            "federated_value": fed_Q,
+            "value_rel": abs(fed_Q - pooled_Q) / max(abs(pooled_Q), 1e-300),
+            "gradient_rel": float(
+                np.linalg.norm(fed_g - pooled_g) / max(np.linalg.norm(pooled_g), 1e-300)
+            ),
+        }
+    return {"model": model, "subjects": nb, "theta": theta0.tolist(), "probes": out}
+
+
 if __name__ == "__main__":
-    # python -m nolimits_flower.task {fit|ref|probe} <model> [estimator] [ghq] [seed] [source]
+    # python -m nolimits_flower.task {fit|ref|probe|mcem-probe} <model> [estimator] [ghq] [seed] [source]
     # -> one "POOLED_JSON {...}" line on stdout.
     import json
     import sys
@@ -889,6 +1021,8 @@ if __name__ == "__main__":
     )
     if mode == "probe":
         result = additivity_probe(model, 0, *rest[1:])
+    elif mode == "mcem-probe":
+        result = mcem_additivity_probe(model, rest[2], rest[3])
     elif mode == "fit":
         result = pooled_fit(model, *rest)
     else:
