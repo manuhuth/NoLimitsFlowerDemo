@@ -5,8 +5,8 @@ Four estimators are wired, all through the same protocol —
 (`task._method` maps the `estimator` string to the NoLimits method; `task.objective_and_gradient`
 calls it). Every one of them is a **sum over subjects**, so the summed site contributions are
 the pooled-data value and gradient **exactly**. Additivity (federated == pooled) holds for
-**all four**. (`mle`/`map` federate the same way on the no-RE model; `mcem` is the one
-**nested** estimator - local E-step, federated M-step - documented at the end.)
+**all four**. (`mle`/`map` federate the same way on the no-RE model; `mcem` and `saem` are the
+**nested** estimators - local E-step, federated M-step - documented at the end.)
 
 | `estimator` | NoLimits method | additivity of (value, gradient) | fit acceptance | per-round cost |
 |---|---|---|---|---|
@@ -189,7 +189,7 @@ flwr run . --stream --run-config 'model="warfarin" data-source="simulated" estim
   --federation-config "num-supernodes=3 client-resources-num-cpus=3 init-args-num-cpus=3"
 ```
 
-MCEM is the one **nested** estimator. It does not go through the single-shot
+MCEM is a **nested** estimator (SAEM below is the other). It does not go through the single-shot
 `objective_and_gradient` protocol above; there is no deterministic `theta`-objective to sum.
 Instead the server drives an outer EM loop, and each **outer iteration** is three federated
 rounds:
@@ -247,7 +247,79 @@ parameter `8.85e-3` on warfarin/simulated).
 **Reach for it** when you want a simulation-based (rather than Laplace-approximate) marginal
 likelihood and can afford the nested loop; avoid it under DP unless the large `ε` is acceptable.
 
-## Not federated
+## `saem` — Stochastic-Approximation EM (nested: local E-step, federated hybrid M-step)
 
-`SAEM` is **not** federated in this demo: although its closed-form M-step primitives exist
-upstream in NoLimits, the demo does not wire it.
+```bash
+flwr run . --stream --run-config 'model="warfarin" data-source="simulated" estimator="saem"' \
+  --federation-config "num-supernodes=3 client-resources-num-cpus=3 init-args-num-cpus=3"
+```
+
+SAEM is the second **nested** estimator, and like MCEM it does not go through the single-shot
+`objective_and_gradient` protocol. Its E-step is the **same** local MH sampler MCEM uses (the
+draws are cached in the site and never leave it), but its M-step is **hybrid**: the
+random-effect covariances and the residual variance have a **closed form** in the sufficient
+statistics, while the remaining parameters are maximized numerically. Each **outer iteration**
+is four rounds:
+
+1. **E-step (LOCAL).** Identical to MCEM - the server broadcasts `theta`, each site draws
+   `p(eta_i | y_i, theta)` for **its own subjects** with `SaemixMH` and caches the FIXED draws.
+   Nothing is aggregated.
+2. **Sufficient-statistics round (FEDERATED sum).** Each site emits its **per-subject-additive**
+   SAEM sufficient statistics (`saem_sufficient_statistics`) over those draws, DE-NORMALIZED so
+   the population statistics are a plain coordinate-wise sum (RE moments as `Σx = mean·n` and
+   `Σxx' = second·n`; outcome/HMM fields are already sums). The server **sums** the per-site
+   payloads in numpy - one vector, no Julia.
+3. **Closed-form M-step (COORDINATOR site).** Site 0 re-normalizes the summed statistics and
+   runs the **stateful** closed-form update (`saem_closed_form_mstep`, bit-identical to the
+   fit) at this iteration's stochastic-approximation step size `γ`, threading the smoothed state
+   to the next iteration. It returns the closed-form-eligible parameters - here `omega_ka`,
+   `omega_cl`, `omega_v`, `sigma`.
+4. **Numerical M-step (FEDERATED).** A small L-BFGS-B over the remaining parameters (`ka`, `cl`,
+   `v`), reusing the **MCEM `Q` kernel** restricted to the non-closed-form names; each evaluation
+   broadcasts a candidate `theta` and the server sums the per-site `(value, gradient)` exactly as
+   MCEM does. The closed-form/numerical split (with the `q1`/`q2` part each numerical name lives
+   in) is `saem_closed_form_eligibility` + `mcem_q_partition`, reported in the prepare round.
+
+The server stays **Julia-free** - it only sums per-site payloads and runs scipy. A **fixed outer
+budget** (`task.SAEM_OUTER_ITERS`, 20, == the pooled fit's `maxiters`) drives the γ schedule with
+no convergence test. SAEM **requires random effects**, so it runs on `warfarin`/`theophylline`,
+**not** the no-RE `theoph-pooled`.
+
+**Exactness.** The summed per-site payload **is** the pooled sufficient statistics, to machine
+precision: summing each subject's DE-NORMALIZED additive statistics reproduces the population
+statistics at **< 1e-10** relative error (`python -m nolimits_flower.task saem-probe warfarin` /
+`tests/test_equivalence.py::test_saem_sufficient_stats_additivity`). That is the exactness proof
+for the closed-form half; the numerical half is exact for the same reason MCEM's is. The
+end-to-end acceptance is **parameter-wise vs `fit_model(dm, SAEM())`** at a **Monte-Carlo**
+tolerance (`5e-2`): SAEM is stochastic and the per-site RNG partition differs from the pooled
+run, so the two optima agree only up to sampling noise.
+
+!!! warning "DP-SAEM composes over the stats release AND the numerical Adam steps - but is cheaper than DP-MCEM"
+    Under `dp=true` the E-step still stays local; what is released each outer iteration is (a)
+    **one** noised sufficient-statistics vector - each site clips **per subject** (the DP unit)
+    and adds its Gaussian noise share, the server sums - and (b) the numerical M-step, now
+    fixed-schedule **DP-Adam** on per-subject-clipped, noised part gradients
+    (`mcem-dp-mstep-steps` steps per numerical part - the knob SAEM shares with MCEM). The
+    composition length is therefore
+    `outer × (1 stats release + numerical-parts × mcem-dp-mstep-steps)`, and the accountant counts
+    **all** of them at the one noise multiplier. This is **cheaper per iteration than DP-MCEM**:
+    the closed-form parameters (`omega_*`, `sigma`) ride the single shared stats release instead
+    of each getting its own DP-Adam block. Robustness to the noise is built in: the closed-form
+    M-step **floors a noise-perturbed covariance** (NoLimits clamps a negative variance estimate
+    to zero), and the numerical Adam step **reverts on a non-finite gradient**, so the fit stays
+    finite. Nothing un-noised is released: no objective, no per-site contribution.
+
+    ```bash
+    flwr run . --stream --run-config \
+      'model="warfarin" data-source="simulated" estimator="saem" dp=true dp-noise-multiplier=0.5 dp-clip-mode="joint" mcem-dp-mstep-steps=2' \
+      --federation-config "num-supernodes=3 client-resources-num-cpus=3 init-args-num-cpus=3"
+    ```
+
+**Reach for it** when you want the classical SAEM closed-form M-step (rather than MCEM's fully
+numerical one) and a single sufficient-statistics release per iteration under DP.
+
+## All wired estimators federate
+
+Every estimator above is federated: the six single-shot ones (`laplace`, `focei`, `ghq`,
+`pooled`, `mle`, `map`) as exact per-subject sums, and the two nested ones (`mcem`, `saem`) as a
+local E-step plus a federated M-step. No wired estimator runs pooled-only.

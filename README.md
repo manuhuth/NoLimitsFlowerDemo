@@ -55,7 +55,7 @@ federates the real warfarin PK data from `data/warfarin.csv`, no download needed
 
 The behaviour is controlled by `--run-config 'key=value ...'` knobs - `model` (`warfarin`,
 `theophylline`, `warfarin-nn`, `orange`, `theoph-pooled`), `estimator` (`laplace`, `focei`,
-`ghq`, `pooled`, `mcem` for the mixed-effects models; `mle`, `map` for the naive-pooled
+`ghq`, `pooled`, `mcem`, `saem` for the mixed-effects models; `mle`, `map` for the naive-pooled
 `theoph-pooled`), and the differential-privacy `dp*` family. TOML strings need their own quotes inside the
 shell quotes, e.g. `--run-config 'model="theophylline"'`. The full knob table is in the docs
 [Overview](https://manuhuth.github.io/NoLimitsFlowerDemo/).
@@ -65,7 +65,7 @@ shell quotes, e.g. `--run-config 'model="theophylline"'`. The full knob table is
 Full documentation is at **https://manuhuth.github.io/NoLimitsFlowerDemo/**:
 
 - [Models](https://manuhuth.github.io/NoLimitsFlowerDemo/models/) - the four models, their real data, and the classical-vs-neural-on-identical-warfarin highlight.
-- [Estimators](https://manuhuth.github.io/NoLimitsFlowerDemo/estimators/) - `laplace | focei | ghq | pooled` (mixed-effects), `mle | map` (naive-pooled), and `mcem` (nested: local E-step, federated M-step), when to use which.
+- [Estimators](https://manuhuth.github.io/NoLimitsFlowerDemo/estimators/) - `laplace | focei | ghq | pooled` (mixed-effects), `mle | map` (naive-pooled), and `mcem`/`saem` (nested: local E-step, federated M-step), when to use which.
 - [Differential privacy](https://manuhuth.github.io/NoLimitsFlowerDemo/differential-privacy/) - the DP-Adam mode, its knobs, and the `(σ, T) → ε` accountant.
 - [Optimizer & scipy interface](https://manuhuth.github.io/NoLimitsFlowerDemo/optimizer/) - the pure numpy/scipy server, one round per objective evaluation.
 - [Architecture](https://manuhuth.github.io/NoLimitsFlowerDemo/architecture/) - prepare round, main-thread Julia warm-up, additivity as the exactness proof.
