@@ -535,6 +535,136 @@ def _run_mcem(grid, context, config, dp, names, x0, mask, num_sites, mcem_parts)
         "M-step exactness proven separately by Q-additivity", theta_rel.max(), MCEM_PARAM_TOL)
 
 
+def _run_mcem_dp(grid, context, config, dp, names, x0, mask, num_sites, mcem_parts):
+    """DP-MCEM: the M-step L-BFGS-B is replaced by the demo's fixed-schedule DP-Adam on
+    per-subject-clipped, Gaussian-noised part gradients. The E-step stays LOCAL (draws never
+    leave a site). Each part of each outer iteration spends `mcem-dp-mstep-steps` gradient
+    releases, so the composition length is outer x 2 parts x steps.
+
+    HONEST CAVEAT: DP composes over EVERY Adam step across ALL outer iterations, so the budget
+    (and eps) is large - MCEM is the most privacy-expensive estimator, and the accountant here
+    counts every release. Clips each part JOINTLY (clip-mode is not applied to MCEM). Writes
+    results-path with the fit and the spent (eps, delta) over all releases; nothing un-noised
+    is released (no objective, no per-site contribution)."""
+    estimator = "mcem"
+    ghq_level = int(context.run_config["ghq-level"])
+    results_path = Path(str(context.run_config.get("results-path", "results.json"))).resolve()
+    q1_names, q2_names = mcem_parts
+    q1i = np.array([names.index(n) for n in q1_names], dtype=int)
+    q2i = np.array([names.index(n) for n in q2_names], dtype=int)
+    outer_iters = task.MCEM_OUTER_ITERS
+    steps = int(context.run_config.get("mcem-dp-mstep-steps", 3))
+    if steps < 1:
+        raise ValueError("mcem-dp-mstep-steps must be >= 1")
+    s = task.precondition_scale(x0, mask)
+    theta = x0.copy()
+    releases = 0
+    slowest = 0.0
+    t0 = time.perf_counter()
+
+    total_releases = outer_iters * (int(q1i.size > 0) + int(q2i.size > 0)) * steps
+    log(INFO, "DP-MCEM: %d sites, %d outer iterations x parts x %d Adam steps = %d gradient "
+        "releases, DP unit subject, JOINT per-part clipping", num_sites, outer_iters, steps,
+        total_releases)
+    log(WARNING, "DP-MCEM caveat: differential privacy composes over EVERY Adam step across "
+        "ALL outer iterations, so eps grows with (outer x parts x steps) - MCEM is the most "
+        "privacy-expensive estimator; the accountant below counts all %d releases", total_releases)
+
+    def dp_gradient(cand_theta, part, part_precond, k):
+        """One DP release: the sum of the sites' CLIPPED, NOISED part gradients."""
+        nonlocal releases, slowest
+        releases += 1
+        t_round = time.perf_counter()
+        cfg = ConfigRecord({**dict(config.items()), "mcem-phase": "mstep", "mcem-part": part,
+                            "mcem-outer-iter": k, "dp-sites": num_sites,
+                            "dp-release": "gradient", "dp-precond": part_precond.tolist()})
+        replies = _send_all(grid, "query", {"theta": ArrayRecord([cand_theta]), "config": cfg},
+                            f"dp-mcem release {releases}")
+        vec = np.sum([r.content["release"].to_numpy_ndarrays()[0] for r in replies], axis=0)
+        if not np.all(np.isfinite(vec)):
+            raise SiteFailure(f"release {releases}: non-finite dp gradient")
+        slowest = max(slowest, time.perf_counter() - t_round)
+        return vec
+
+    def adam_part(theta, part, idxs, k):
+        """Fixed-schedule Adam ascent over one part's preconditioned coordinate z."""
+        if idxs.size == 0:
+            return theta
+        ss = s[idxs]
+        x_sub0 = theta[idxs].copy()
+        z = np.zeros_like(x_sub0)
+        m = np.zeros_like(z)
+        v = np.zeros_like(z)
+        for t in range(1, steps + 1):
+            cand = theta.copy()
+            cand[idxs] = x_sub0 + ss * z
+            g = dp_gradient(cand, part, ss, k)  # noised part gradient in the z coordinate
+            m = 0.9 * m + 0.1 * g
+            v = 0.999 * v + 0.001 * g * g
+            z = z + dp["lr"] * (m / (1 - 0.9 ** t)) / (np.sqrt(v / (1 - 0.999 ** t)) + 1.0e-8)
+        out = theta.copy()
+        out[idxs] = x_sub0 + ss * z
+        return out
+
+    for k in range(1, outer_iters + 1):
+        estep_cfg = ConfigRecord({**dict(config.items()), "mcem-phase": "estep",
+                                  "mcem-outer-iter": k})
+        _send_all(grid, "query", {"theta": ArrayRecord([theta]), "config": estep_cfg},
+                  f"dp-mcem e-step {k}")
+        theta = adam_part(theta, "q1", q1i, k)
+        theta = adam_part(theta, "q2", q2i, k)
+        log(INFO, "  dp-mcem outer %2d/%d: %d releases so far", k, outer_iters, releases)
+    wall = time.perf_counter() - t0
+    natural = task.to_natural(theta, mask)
+
+    dp_block = {
+        "enabled": True,
+        "adjacency": task.DP_ADJACENCY,
+        "unit": "subject",
+        "epsilon": task.dp_epsilon(releases, dp["noise-multiplier"], dp["delta"]),
+        "delta": dp["delta"],
+        "releases": releases,
+        "sites": num_sites,
+        "clip-mode": "joint-per-part",
+        "noise": "distributed: each site adds N(0, (sigma*clip)^2 / sites)",
+        "clip": dp["clip"],
+        "noise-multiplier": dp["noise-multiplier"],
+        "outer-iterations": outer_iters,
+        "mstep-steps": steps,
+        "lr": dp["lr"],
+        "caveat": ("DP composes over every Adam step across all outer iterations; MCEM is the "
+                   "most privacy-expensive estimator, so eps is large for a useful fit"),
+        "epsilon-per-site-vs-server": task.dp_epsilon(
+            releases, dp["noise-multiplier"] / np.sqrt(num_sites), dp["delta"]),
+    }
+    results = {
+        "converged": None,
+        "message": (f"DP-MCEM: {outer_iters} outer iterations, {steps} DP-Adam steps per "
+                    "M-step part; no convergence test on noisy gradients"),
+        "objective": None,
+        "names": names,
+        "theta_natural": dict(zip(names, natural.tolist())),
+        "theta_transformed": dict(zip(names, theta.tolist())),
+        "config": {"model": str(context.run_config["model"]), "estimator": estimator,
+                   "ghq-level": ghq_level},
+        "rounds": releases,
+        "timings": {"total-seconds": round(wall, 3), "slowest-round-seconds": round(slowest, 3)},
+        "dp": dp_block,
+    }
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    results_path.write_text(json.dumps(results, indent=2) + "\n")
+
+    log(INFO, "DP-MCEM FEDERATED FIT (%d sites, %d releases, wall=%.1fs)", num_sites, releases, wall)
+    log(INFO, "  %-14s %16s %16s", "parameter", "natural", "transformed")
+    for name, nat, tr in zip(names, natural, theta):
+        log(INFO, "  %-14s %16.8g %16.8g", name, nat, tr)
+    log(INFO, "  DIFFERENTIAL PRIVACY ACTIVE: (eps=%.4g, delta=%.3g) spent over %d releases, "
+        "adjacency %s, unit subject", dp_block["epsilon"], dp["delta"], releases, task.DP_ADJACENCY)
+    log(INFO, "  results written to %s", results_path)
+    log(INFO, "PASS: DP federated fit complete (eps=%.4g at delta=%.3g)", dp_block["epsilon"],
+        dp["delta"])
+
+
 def _fit(grid: Grid, context: Context) -> None:
     model = str(context.run_config["model"])
     estimator = str(context.run_config["estimator"])

@@ -157,6 +157,31 @@ def _mcem_mstep(context: Context, config, theta):
     return float(Q), np.asarray(g, dtype=float)
 
 
+def _mcem_dp_contribution(context: Context, config, theta):
+    """This site's NOISED M-step part-gradient for one DP-Adam step: (vector, clip bound).
+
+    Per-subject clip + noise on the part's gradient rows (the DP unit is the subject, one
+    random-effect batch each). Clipped in the preconditioned coordinate the server's Adam
+    steps in (transformed axes x the part's scale s), then this site adds its 1/S noise share.
+    MCEM-DP clips each part JOINTLY (one clip over the part's sub-vector); nothing un-noised
+    leaves this function."""
+    key = _site_key(context)
+    outer = int(config["mcem-outer-iter"])
+    part = str(config["mcem-part"])
+    draws = _site_mcem_draws[(key, outer)]
+    q1_names, q2_names = _mcem_parts(context)
+    fnames = q1_names if part == "q1" else q2_names
+    _, grads = nl.seval("nlf_mcem_dp_part")(_site_dm(context), theta, draws, part, fnames)
+    grads = np.atleast_2d(np.asarray(grads, dtype=float))
+    precond = np.asarray(config["dp-precond"], dtype=float)  # the part's scale s, server-sent
+    grads = grads * precond[None, :]
+    clip = float(config["dp-clip"])
+    sigma, sites = float(config["dp-noise-multiplier"]), int(config["dp-sites"])
+    summed = task.dp_clip_sum(grads, clip)
+    noisy = summed + task.dp_noise(grads.shape[1], clip, sigma, sites)
+    return noisy, clip
+
+
 @app.query("prepare")
 def prepare(msg: Message, context: Context) -> Message:
     """Warm this site: build the DataModel, burn one objective call, report theta0/names."""

@@ -70,6 +70,11 @@ dp-final-value = false   # also privately release the final (noised) objective f
 dp-value-clip = 100.0    # per-subject clip on the objective value, when dp-final-value is on
 results-path = "results.json"  # where the dp fit writes its results + (eps, delta) block
 
+# MCEM + dp only: DP-Adam gradient releases per M-step part per outer iteration. The privacy
+# composition length is (MCEM outer iterations x 2 parts x this), so eps grows fast - MCEM is
+# the most privacy-expensive estimator. See docs/estimators.md.
+mcem-dp-mstep-steps = 3
+
 [tool.pytest.ini_options]
 markers = [
     "slow: boots one Julia per site and fits (minutes)",

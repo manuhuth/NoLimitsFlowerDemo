@@ -262,6 +262,35 @@ def test_mcem_federated_fit_matches_pooled():
     assert "PASS: federated MCEM matches the pooled fit" in log, log[-4000:]
 
 
+def _mcem_dp_run(tmp_path, sigma=0.5, steps=2) -> dict:
+    out = tmp_path / "dp_mcem.json"
+    log = run_federated(
+        f'model="warfarin" data-source="simulated" estimator="mcem" dp=true '
+        f'dp-noise-multiplier={sigma} dp-clip-mode="joint" mcem-dp-mstep-steps={steps} '
+        f'results-path="{out}"'
+    )
+    assert "PASS: DP federated fit complete" in log, log[-4000:]
+    return json.loads(out.read_text())
+
+
+@pytest.mark.slow
+def test_mcem_dp_run_and_reports_finite_epsilon(tmp_path):
+    """DP-MCEM completes and writes a dp block whose eps is the accountant over EVERY release
+    (outer x 2 parts x steps): MCEM is the most privacy-expensive estimator. Nothing un-noised
+    leaks (no objective, no per-site block)."""
+    import math
+    steps = 2
+    res = _mcem_dp_run(tmp_path, steps=steps)
+    dp = res["dp"]
+    assert dp["enabled"] and dp["unit"] == "subject" and dp["clip-mode"] == "joint-per-part"
+    assert dp["releases"] == task.MCEM_OUTER_ITERS * 2 * steps  # outer x parts x steps
+    assert math.isfinite(dp["epsilon"]) and dp["epsilon"] > 0
+    # The reported eps IS the accountant on (all releases, sigma, delta).
+    assert abs(dp["epsilon"] - task.dp_epsilon(dp["releases"], 0.5, dp["delta"])) < 1e-9
+    assert all(math.isfinite(v) for v in res["theta_natural"].values())
+    assert res["objective"] is None and "sites" not in res
+
+
 @pytest.mark.slow
 def test_one_failing_site_aborts_the_run():
     """A site raising must abort, never yield a partial sum."""
