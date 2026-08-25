@@ -36,6 +36,17 @@ app = ClientApp()
 
 _site_dms: dict[tuple, object] = {}
 _site_subjects: dict[tuple, int] = {}
+# MCEM (nested EM) per-site caches: the warm-start sampler state threads across OUTER
+# iterations, and one outer iteration's draws are HELD FIXED across its M-step rounds. These
+# live in module globals for the same reason the DataModel does - ClientApp objects are
+# rebuilt per message, so only a module global survives across rounds within one process.
+_site_mcem_state: dict[tuple, object] = {}
+_site_mcem_draws: dict[tuple, object] = {}  # (site_key, outer_iter) -> draws (shared by SAEM)
+_site_mcem_parts: dict[tuple, tuple] = {}   # site_key -> (q1_names, q2_names)
+# SAEM reuses the MCEM E-step + draw caches above; it adds the coordinator's SA smoothed-stats
+# state (a Julia object threaded across outer iterations) and its own parameter partition.
+_site_saem_smoothed: dict[tuple, object] = {}  # site_key -> carried smoothed_state (coordinator)
+_site_saem_parts: dict[tuple, tuple] = {}      # site_key -> (closed_form, numerical, q1, q2)
 
 
 def _site_key(context: Context) -> tuple:
@@ -109,6 +120,148 @@ def _dp_contribution(context: Context, config, theta):
     return noisy, bound
 
 
+def _mcem_parts(context: Context):
+    """This site's (q1_names, q2_names) M-step partition, cached per site."""
+    key = _site_key(context)
+    if key not in _site_mcem_parts:
+        parts = nl.seval("nlf_mcem_parts")(_site_dm(context))
+        _site_mcem_parts[key] = ([str(s) for s in parts.q1], [str(s) for s in parts.q2])
+    return _site_mcem_parts[key]
+
+
+def _mcem_estep(context: Context, config, theta) -> None:
+    """One LOCAL E-step: sample this site's posteriors at theta, cache the FIXED draws + the
+    threaded warm-start state. outer-iter 1 resets (fresh state, prior-mean seeding)."""
+    key = _site_key(context)
+    site_id = int(context.node_config["partition-id"])
+    outer = int(config["mcem-outer-iter"])
+    if outer == 1:  # new run: drop any stale state/draws from a previous run in this actor
+        _site_mcem_state.pop(key, None)
+        for k in [k for k in _site_mcem_draws if k[0] == key]:
+            del _site_mcem_draws[k]
+    state = None if outer == 1 else _site_mcem_state.get(key)
+    draws, new_state = nl.seval("nlf_mcem_estep")(
+        _site_dm(context), theta,
+        int(config["mcem-sample-schedule"]), int(config["mcem-maxiters"]),
+        int(config["mcem-seed"]) + site_id, state,
+    )
+    _site_mcem_state[key] = new_state
+    _site_mcem_draws[(key, outer)] = draws
+
+
+def _mcem_mstep(context: Context, config, theta):
+    """One M-step Q (value, part-gradient) at the FIXED draws of this outer iteration."""
+    key = _site_key(context)
+    outer = int(config["mcem-outer-iter"])
+    part = str(config["mcem-part"])
+    draws = _site_mcem_draws[(key, outer)]
+    q1_names, q2_names = _mcem_parts(context)
+    fnames = q1_names if part == "q1" else q2_names
+    Q, g = nl.seval("nlf_mcem_q")(_site_dm(context), theta, draws, part, fnames)
+    return float(Q), np.asarray(g, dtype=float)
+
+
+def _mcem_dp_contribution(context: Context, config, theta):
+    """This site's NOISED M-step part-gradient for one DP-Adam step: (vector, clip bound).
+
+    Per-subject clip + noise on the part's gradient rows (the DP unit is the subject, one
+    random-effect batch each). Clipped in the preconditioned coordinate the server's Adam
+    steps in (transformed axes x the part's scale s), then this site adds its 1/S noise share.
+    MCEM-DP clips each part JOINTLY (one clip over the part's sub-vector); nothing un-noised
+    leaves this function."""
+    key = _site_key(context)
+    outer = int(config["mcem-outer-iter"])
+    part = str(config["mcem-part"])
+    draws = _site_mcem_draws[(key, outer)]
+    q1_names, q2_names = _mcem_parts(context)
+    fnames = q1_names if part == "q1" else q2_names
+    _, grads = nl.seval("nlf_mcem_dp_part")(_site_dm(context), theta, draws, part, fnames)
+    grads = np.atleast_2d(np.asarray(grads, dtype=float))
+    precond = np.asarray(config["dp-precond"], dtype=float)  # the part's scale s, server-sent
+    grads = grads * precond[None, :]
+    clip = float(config["dp-clip"])
+    sigma, sites = float(config["dp-noise-multiplier"]), int(config["dp-sites"])
+    summed = task.dp_clip_sum(grads, clip)
+    noisy = summed + task.dp_noise(grads.shape[1], clip, sigma, sites)
+    return noisy, clip
+
+
+def _saem_parts(context: Context):
+    """This site's (closed_form, numerical, q1, q2) SAEM partition, cached per site."""
+    key = _site_key(context)
+    if key not in _site_saem_parts:
+        p = nl.seval("nlf_saem_parts")(_site_dm(context))
+        _site_saem_parts[key] = tuple([str(s) for s in getattr(p, f)]
+                                      for f in ("closed_form", "numerical", "q1", "q2"))
+    return _site_saem_parts[key]
+
+
+def _saem_stats(context: Context, config, theta) -> np.ndarray:
+    """This site's DE-NORMALIZED additive sufficient statistics over its FIXED draws. The server
+    sums these coordinate-wise across sites (RE moments de-normalized, outcome/HMM plain sums)."""
+    key = _site_key(context)
+    draws = _site_mcem_draws[(key, int(config["mcem-outer-iter"]))]
+    return np.asarray(nl.seval("nlf_saem_stats_flat")(_site_dm(context), theta, draws), dtype=float)
+
+
+def _saem_numerical(context: Context, config, theta):
+    """One numerical M-step Q (value, gradient) over `saem-free-names` at the FIXED draws -
+    reuses the MCEM Q kernel (`nlf_mcem_q`) restricted to the non-closed-form parameters."""
+    key = _site_key(context)
+    draws = _site_mcem_draws[(key, int(config["mcem-outer-iter"]))]
+    part = str(config["saem-part"])
+    fnames = [str(s) for s in config["saem-free-names"]]
+    Q, g = nl.seval("nlf_mcem_q")(_site_dm(context), theta, draws, part, fnames)
+    return float(Q), np.asarray(g, dtype=float)
+
+
+def _saem_closedform(context: Context, config, summed_flat, theta):
+    """COORDINATOR-only closed-form M-step: reconstruct the aggregated stats from the server's
+    summed flat vector, run the STATEFUL closed-form update at this outer iteration's γ, thread
+    the smoothed_state, and return the eligible params (names, TRANSFORMED-scale values)."""
+    key = _site_key(context)
+    outer = int(config["mcem-outer-iter"])
+    state = None if outer == 1 else _site_saem_smoothed.get(key)
+    names, vals, new_state = nl.seval("nlf_saem_mstep")(
+        _site_dm(context), theta, _site_mcem_draws[(key, outer)],
+        np.asarray(summed_flat, dtype=float), state, outer, int(config["saem-maxiters"]),
+    )
+    _site_saem_smoothed[key] = new_state
+    return [str(s) for s in names], np.asarray(vals, dtype=float)
+
+
+def _saem_dp_stats(context: Context, config, theta):
+    """This site's NOISED sufficient-statistics release for one outer iteration: per-subject
+    clip + distributed Gaussian noise on the DE-NORMALIZED flat rows, then the site sum. The DP
+    unit is the subject; nothing un-noised leaves this function. ponytail: JOINT clip over the
+    whole flat row - the RE-moment, outcome and count fields differ in magnitude, so a small
+    clip shrinks them all; per-field clipping is the upgrade if a useful private fit is needed."""
+    key = _site_key(context)
+    draws = _site_mcem_draws[(key, int(config["mcem-outer-iter"]))]
+    rows = np.atleast_2d(np.asarray(
+        nl.seval("nlf_saem_stats_flat_rows")(_site_dm(context), theta, draws), dtype=float))
+    clip = float(config["dp-clip"])
+    sigma, sites = float(config["dp-noise-multiplier"]), int(config["dp-sites"])
+    return task.dp_clip_sum(rows, clip) + task.dp_noise(rows.shape[1], clip, sigma, sites)
+
+
+def _saem_dp_contribution(context: Context, config, theta):
+    """This site's NOISED numerical M-step gradient for one DP-Adam step: per-subject clip +
+    noise on the part's gradient rows over `saem-free-names` (reuses the MCEM DP-part kernel).
+    Clipped in the preconditioned coordinate the server's Adam steps in."""
+    key = _site_key(context)
+    draws = _site_mcem_draws[(key, int(config["mcem-outer-iter"]))]
+    part = str(config["saem-part"])
+    fnames = [str(s) for s in config["saem-free-names"]]
+    _, grads = nl.seval("nlf_mcem_dp_part")(_site_dm(context), theta, draws, part, fnames)
+    grads = np.atleast_2d(np.asarray(grads, dtype=float))
+    precond = np.asarray(config["dp-precond"], dtype=float)
+    grads = grads * precond[None, :]
+    clip = float(config["dp-clip"])
+    sigma, sites = float(config["dp-noise-multiplier"]), int(config["dp-sites"])
+    return task.dp_clip_sum(grads, clip) + task.dp_noise(grads.shape[1], clip, sigma, sites)
+
+
 @app.query("prepare")
 def prepare(msg: Message, context: Context) -> Message:
     """Warm this site: build the DataModel, burn one objective call, report theta0/names."""
@@ -123,7 +276,40 @@ def prepare(msg: Message, context: Context) -> Message:
     # Under dp that is the per-batch path, and it also reports whether the clip unit really
     # is the subject (max batch ids == 1).
     extra = {}
-    if bool(config["dp"]):
+    reply_extra = {}
+    if str(config["estimator"]) == "mcem":
+        # Warm the nested EM path (E-step + both M-step Q parts) so their first-call
+        # compilation is paid here, and report the q1/q2 partition the server optimizes. The
+        # warm draws are discarded: the real run's outer iteration 1 samples fresh.
+        q1_names, q2_names = _mcem_parts(context)
+        warm_draws, _ = nl.seval("nlf_mcem_estep")(
+            dm, theta0, int(config["mcem-sample-schedule"]), int(config["mcem-maxiters"]),
+            int(config["mcem-seed"]), None,
+        )
+        for part, fn in (("q1", q1_names), ("q2", q2_names)):
+            if fn:
+                nl.seval("nlf_mcem_q")(dm, theta0, warm_draws, part, fn)
+        reply_extra["mcem"] = ConfigRecord({"q1": q1_names, "q2": q2_names})
+    elif str(config["estimator"]) == "saem":
+        # Warm the nested SAEM path (E-step, sufficient-stats flatten, coordinator closed-form
+        # update, numerical Q) so the first-call compilation is paid here, and report the
+        # closed-form/numerical partition (with the mcem q1/q2 split) the server routes on. The
+        # warm draws/state are discarded: the real run's outer iteration 1 samples fresh.
+        closed_form, numerical, q1_names, q2_names = _saem_parts(context)
+        warm_draws, _ = nl.seval("nlf_mcem_estep")(
+            dm, theta0, int(config["mcem-sample-schedule"]), int(config["mcem-maxiters"]),
+            int(config["mcem-seed"]), None,
+        )
+        flat = np.asarray(nl.seval("nlf_saem_stats_flat")(dm, theta0, warm_draws), dtype=float)
+        nl.seval("nlf_saem_mstep")(dm, theta0, warm_draws, flat, None, 1,
+                                   int(config["saem-maxiters"]))
+        for part, part_names in (("q1", q1_names), ("q2", q2_names)):
+            fn = [n for n in numerical if n in part_names]
+            if fn:
+                nl.seval("nlf_mcem_q")(dm, theta0, warm_draws, part, fn)
+        reply_extra["saem"] = ConfigRecord({"closed_form": closed_form, "numerical": numerical,
+                                            "q1": q1_names, "q2": q2_names})
+    elif bool(config["dp"]):
         _, _, max_batch_ids = task.dp_batch_contributions(
             nl, dm, theta0, str(config["estimator"]), int(config["ghq-level"])
         )
@@ -147,6 +333,7 @@ def prepare(msg: Message, context: Context) -> Message:
                 "setup-seconds": setup_seconds,
                 **extra,
             }),
+            **reply_extra,
         }),
         reply_to=msg,
     )
@@ -161,6 +348,86 @@ def site_objective(msg: Message, context: Context) -> Message:
     if site_id == int(context.run_config["fail-site"]):
         raise RuntimeError(f"fault injection: site {site_id} refuses to answer")
     theta = msg.content["theta"].to_numpy_ndarrays()[0]
+    # SAEM (nested EM): like MCEM the E-step is LOCAL (reused verbatim), but the M-step is
+    # HYBRID. Per outer iteration: a stats round (each site emits per-subject-additive
+    # sufficient statistics the server sums), a closed-form round (the COORDINATOR site runs
+    # the stateful closed-form update on the summed stats), and numerical rounds (federated Q
+    # for the non-closed-form params, the same kernel as MCEM).
+    if str(config["estimator"]) == "saem":
+        sphase = str(config.get("saem-phase", ""))
+        if sphase == "estep":
+            _mcem_estep(context, config, theta)  # reuse the MCEM E-step + draw cache verbatim
+            return Message(
+                content=RecordDict({"result": MetricRecord({"site-id": site_id, "ready": 1})}),
+                reply_to=msg,
+            )
+        if sphase == "stats":
+            # Under dp the release is the per-subject-clipped, noised sufficient statistics.
+            stats = (_saem_dp_stats(context, config, theta) if bool(config.get("dp", False))
+                     else _saem_stats(context, config, theta))
+            return Message(
+                content=RecordDict({
+                    "stats": ArrayRecord([stats]),
+                    "result": MetricRecord({"site-id": site_id}),
+                }),
+                reply_to=msg,
+            )
+        if sphase == "closedform":
+            summed = msg.content["stats"].to_numpy_ndarrays()[0]
+            names, vals = _saem_closedform(context, config, summed, theta)
+            return Message(
+                content=RecordDict({
+                    "updates": ConfigRecord({"names": names, "values": vals.tolist()}),
+                    "result": MetricRecord({"site-id": site_id}),
+                }),
+                reply_to=msg,
+            )
+        if sphase == "numerical":
+            if bool(config.get("dp", False)):
+                return Message(
+                    content=RecordDict({
+                        "release": ArrayRecord([_saem_dp_contribution(context, config, theta)]),
+                        "result": MetricRecord({"site-id": site_id}),
+                    }),
+                    reply_to=msg,
+                )
+            value, gradient = _saem_numerical(context, config, theta)
+            return Message(
+                content=RecordDict({
+                    "gradient": ArrayRecord([gradient]),
+                    "result": MetricRecord({"value": value, "site-id": site_id}),
+                }),
+                reply_to=msg,
+            )
+    # MCEM (nested EM): the outer iteration's phase is on the wire. The E-step is LOCAL - it
+    # samples this site's posteriors and caches the draws, releasing NOTHING. Each M-step
+    # round returns this site's per-part Q (value, gradient) over those cached draws, which
+    # the server sums (or, under dp, the clipped+noised gradient release).
+    phase = str(config.get("mcem-phase", "")) if str(config["estimator"]) == "mcem" else ""
+    if phase == "estep":
+        _mcem_estep(context, config, theta)
+        return Message(
+            content=RecordDict({"result": MetricRecord({"site-id": site_id, "ready": 1})}),
+            reply_to=msg,
+        )
+    if phase == "mstep":
+        if bool(config.get("dp", False)):
+            release, _ = _mcem_dp_contribution(context, config, theta)
+            return Message(
+                content=RecordDict({
+                    "release": ArrayRecord([release]),
+                    "result": MetricRecord({"site-id": site_id}),
+                }),
+                reply_to=msg,
+            )
+        value, gradient = _mcem_mstep(context, config, theta)
+        return Message(
+            content=RecordDict({
+                "gradient": ArrayRecord([gradient]),
+                "result": MetricRecord({"value": value, "site-id": site_id}),
+            }),
+            reply_to=msg,
+        )
     if bool(config.get("dp", False)):
         # Under dp the ONLY thing this site releases is the clipped, noised vector: no value
         # and no per-site log-likelihood.

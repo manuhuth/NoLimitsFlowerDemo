@@ -188,7 +188,7 @@ def test_agree_rejects_an_empty_prepare_round():
 
 # --- estimator selection / error parsing ------------------------------------------
 
-@pytest.mark.parametrize("bad", ["saem", "mcem", "vi", "", "Laplace"])
+@pytest.mark.parametrize("bad", ["vi", "", "Laplace"])
 def test_unknown_estimator_is_rejected(bad):
     with pytest.raises(ValueError, match="unknown estimator"):
         task._method(nl=None, estimator=bad, ghq_level=5)

@@ -227,6 +227,138 @@ def test_dp_per_subject_leave_one_out_bounded_by_clip():
         assert np.linalg.norm(full - loo) <= clip + 1e-9, i
 
 
+# --- MCEM: nested federated EM (local E-step, federated M-step) --------------------
+
+def _mcem_probe(model: str, source: str = "simulated", timeout: float = 2400) -> dict:
+    proc = subprocess.run(
+        [sys.executable, "-m", "nolimits_flower.task", "mcem-probe", model, "mcem", "5",
+         "20260818", source],
+        cwd=REPO, capture_output=True, text=True, timeout=timeout,
+    )
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    line = next(l for l in proc.stdout.splitlines() if l.startswith("POOLED_JSON "))
+    return json.loads(line[len("POOLED_JSON "):])
+
+
+@pytest.mark.slow
+def test_mcem_q_additivity_at_fixed_draws():
+    """The EXACTNESS proof: at FIXED posterior draws, sum over subjects of the per-subject
+    M-step Q (value AND gradient) == the population Q, to machine precision, for both parts
+    (q1 observation-side, q2 random-effect distribution). This is why the federated M-step IS
+    the pooled M-step."""
+    probes = _mcem_probe("warfarin")["probes"]
+    assert set(probes) == {"q1", "q2"}, probes
+    for part, p in probes.items():
+        print(f"warfarin/{part}: value_rel={p['value_rel']:.3e} gradient_rel={p['gradient_rel']:.3e}")
+        assert p["value_rel"] < 1e-10, (part, p)
+        assert p["gradient_rel"] < 1e-10, (part, p)
+
+
+@pytest.mark.slow
+def test_mcem_federated_fit_matches_pooled():
+    """Nested federated MCEM (local E-step + federated M-step over q1 then q2) reproduces
+    fit_model(dm, MCEM()) to a Monte-Carlo tolerance; the ServerApp holds the gate."""
+    log = run_federated('model="warfarin" data-source="simulated" estimator="mcem"')
+    assert "PASS: federated MCEM matches the pooled fit" in log, log[-4000:]
+
+
+def _mcem_dp_run(tmp_path, sigma=0.5, steps=2) -> dict:
+    out = tmp_path / "dp_mcem.json"
+    log = run_federated(
+        f'model="warfarin" data-source="simulated" estimator="mcem" dp=true '
+        f'dp-noise-multiplier={sigma} dp-clip-mode="joint" mcem-dp-mstep-steps={steps} '
+        f'results-path="{out}"'
+    )
+    assert "PASS: DP federated fit complete" in log, log[-4000:]
+    return json.loads(out.read_text())
+
+
+@pytest.mark.slow
+def test_mcem_dp_run_and_reports_finite_epsilon(tmp_path):
+    """DP-MCEM completes and writes a dp block whose eps is the accountant over EVERY release
+    (outer x 2 parts x steps): MCEM is the most privacy-expensive estimator. Nothing un-noised
+    leaks (no objective, no per-site block)."""
+    import math
+    steps = 2
+    res = _mcem_dp_run(tmp_path, steps=steps)
+    dp = res["dp"]
+    assert dp["enabled"] and dp["unit"] == "subject" and dp["clip-mode"] == "joint-per-part"
+    assert dp["releases"] == task.MCEM_OUTER_ITERS * 2 * steps  # outer x parts x steps
+    assert math.isfinite(dp["epsilon"]) and dp["epsilon"] > 0
+    # The reported eps IS the accountant on (all releases, sigma, delta).
+    assert abs(dp["epsilon"] - task.dp_epsilon(dp["releases"], 0.5, dp["delta"])) < 1e-9
+    assert all(math.isfinite(v) for v in res["theta_natural"].values())
+    assert res["objective"] is None and "sites" not in res
+
+
+# --- SAEM: nested federated EM (local E-step, federated hybrid M-step) --------------
+
+def _saem_probe(model: str, source: str = "simulated", timeout: float = 2400) -> dict:
+    proc = subprocess.run(
+        [sys.executable, "-m", "nolimits_flower.task", "saem-probe", model, "saem", "5",
+         "20260818", source],
+        cwd=REPO, capture_output=True, text=True, timeout=timeout,
+    )
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    line = next(l for l in proc.stdout.splitlines() if l.startswith("POOLED_JSON "))
+    return json.loads(line[len("POOLED_JSON "):])
+
+
+@pytest.mark.slow
+def test_saem_sufficient_stats_additivity():
+    """The EXACTNESS proof: at FIXED posterior draws, the sum over subjects of the per-subject
+    DE-NORMALIZED additive sufficient statistics == the population statistics, to machine
+    precision. This is why the server's numpy sum of the per-site payloads IS the pooled
+    sufficient statistics that drives the coordinator's closed-form M-step."""
+    probe = _saem_probe("warfarin")
+    print(f"warfarin saem stats value_rel={probe['value_rel']:.3e} "
+          f"closed_form={probe['closed_form']} numerical={probe['numerical']}")
+    assert probe["closed_form"] == ["omega_ka", "omega_cl", "omega_v", "sigma"], probe
+    assert probe["numerical"] == ["ka", "cl", "v"], probe
+    assert probe["value_rel"] < 1e-10, probe
+
+
+@pytest.mark.slow
+def test_saem_federated_fit_matches_pooled():
+    """Nested federated SAEM (local E-step + summed sufficient stats -> coordinator closed-form
+    M-step + federated numerical M-step) reproduces fit_model(dm, SAEM()) to a Monte-Carlo
+    tolerance; the ServerApp holds the gate."""
+    log = run_federated('model="warfarin" data-source="simulated" estimator="saem"')
+    assert "PASS: federated SAEM matches the pooled fit" in log, log[-4000:]
+
+
+def _saem_dp_run(tmp_path, sigma=0.5, steps=2) -> dict:
+    out = tmp_path / "dp_saem.json"
+    log = run_federated(
+        f'model="warfarin" data-source="simulated" estimator="saem" dp=true '
+        f'dp-noise-multiplier={sigma} dp-clip-mode="joint" mcem-dp-mstep-steps={steps} '
+        f'results-path="{out}"'
+    )
+    assert "PASS: DP federated fit complete" in log, log[-4000:]
+    return json.loads(out.read_text())
+
+
+@pytest.mark.slow
+def test_saem_dp_run_and_reports_finite_epsilon(tmp_path):
+    """DP-SAEM completes and writes a dp block whose eps is the accountant over EVERY release:
+    one sufficient-stats release per outer iteration PLUS the numerical DP-Adam steps. The
+    closed-form params ride the shared stats release (post-processing), so SAEM is cheaper per
+    closed-form param than MCEM. Nothing un-noised leaks (no objective, no per-site block)."""
+    import math
+    steps = 2
+    res = _saem_dp_run(tmp_path, steps=steps)
+    dp = res["dp"]
+    assert dp["enabled"] and dp["unit"] == "subject" and dp["clip-mode"] == "joint"
+    # warfarin: 1 numerical part (ka,cl,v in q1); releases = outer x (1 stats + 1 part x steps).
+    expected = task.SAEM_OUTER_ITERS * (1 + len(dp["numerical-parts"]) * steps)
+    assert dp["releases"] == expected, (dp["releases"], expected)
+    assert dp["stats-releases"] == task.SAEM_OUTER_ITERS
+    assert math.isfinite(dp["epsilon"]) and dp["epsilon"] > 0
+    assert abs(dp["epsilon"] - task.dp_epsilon(dp["releases"], 0.5, dp["delta"])) < 1e-9
+    assert all(math.isfinite(v) for v in res["theta_natural"].values())
+    assert res["objective"] is None and "sites" not in res
+
+
 @pytest.mark.slow
 def test_one_failing_site_aborts_the_run():
     """A site raising must abort, never yield a partial sum."""
