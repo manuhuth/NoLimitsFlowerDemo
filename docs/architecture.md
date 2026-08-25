@@ -20,9 +20,9 @@ task.py         the 4-model catalog (model string, real-data loader + column map
 `FitContext`, burns one throwaway `objective_and_gradient` call at the model's default
 `theta`, then replies with a ready flag, its setup wall time, its subject count, its
 parameter names, and the model-default transformed `theta0`. This is where the one-off cost
-lives — Julia boot plus model codegen plus the first evaluation, about 82 s per site, against
-about 0.1 s for a warm round. Paying it in a round of its own keeps it out of optimization
-round 1 and makes it visible:
+lives — Julia boot plus model codegen plus the first evaluation — which far outweighs a warm
+optimization round (both are model-dependent). Paying it in a round of its own keeps it out of
+optimization round 1 and makes it visible:
 
 ```
 PREPARE ROUND (3 sites)
@@ -39,8 +39,8 @@ unpinned FFNN seed. The agreed `theta0` is the fit's start point, so **the serve
 Julia at all** for the optimization.
 
 **Every following round** is one L-BFGS-B objective evaluation: broadcast `theta`, each site
-computes `objective_and_gradient` through its cached `FitContext` (2.6 ms per warm call on a
-warfarin site), the server sums the values and gradients and hands them to L-BFGS-B — see
+computes `objective_and_gradient` through its cached `FitContext`, the server sums the values
+and gradients and hands them to L-BFGS-B — see
 [Optimizer & scipy interface](optimizer.md).
 
 ## Client main-thread Julia warm-up

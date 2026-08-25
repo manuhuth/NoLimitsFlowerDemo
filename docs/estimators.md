@@ -8,12 +8,12 @@ the pooled-data value and gradient **exactly**. Additivity (federated == pooled)
 **all four**. (`mle`/`map` federate the same way on the no-RE model; `mcem` and `saem` are the
 **nested** estimators - local E-step, federated M-step - documented at the end.)
 
-| `estimator` | NoLimits method | additivity of (value, gradient) | fit acceptance | per-round cost |
-|---|---|---|---|---|
-| `laplace` (default) | `Laplace()` | value 0.0, gradient 1.8e-16 | strict: objective `1e-6`, every parameter `1e-3` | 0.10 s |
-| `focei` | `FOCEI()` | value 1.7e-16, gradient 2.1e-16 | strict, same tolerances | 0.11 s |
-| `ghq` | `GHQuadrature(level=ghq-level)` | value 2.0e-16, gradient 2.3e-16 (level 5) | one-sided: no worse than the pooled fit | 0.12 s (lvl 3), 0.13 s (lvl 5) |
-| `pooled` | `Pooled()` | value 0.0, gradient 2.4e-16 | objective `1e-6`, parameters `1e-2` | 0.11 s |
+| `estimator` | NoLimits method | additivity of (value, gradient) | fit acceptance |
+|---|---|---|---|
+| `laplace` (default) | `Laplace()` | value 0.0, gradient 1.8e-16 | strict: objective `1e-6`, every parameter `1e-3` |
+| `focei` | `FOCEI()` | value 1.7e-16, gradient 2.1e-16 | strict, same tolerances |
+| `ghq` | `GHQuadrature(level=ghq-level)` | value 2.0e-16, gradient 2.3e-16 (level 5) | one-sided: no worse than the pooled fit |
+| `pooled` | `Pooled()` | value 0.0, gradient 2.4e-16 | objective `1e-6`, parameters `1e-2` |
 
 Why the sums are exact in every case: subjects are independent, and each estimator's
 objective is a per-subject (per-random-effect-batch) term. `Laplace` and `FOCEI` find each
