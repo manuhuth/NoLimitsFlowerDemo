@@ -34,16 +34,14 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      # The shared Julia project: registered NoLimits (>= 0.2.6 has the federation
-      # primitives) plus CSV for the warfarin loader. It exists only for CSV; without it
-      # juliapkg would resolve NoLimits by itself and the PYTHON_JULIAPKG_* pinning below
-      # could go too.
+      # The shared Julia project: the latest registered NoLimits (the federation
+      # primitives need >= 0.2.7) plus CSV for the warfarin loader. It exists only for CSV;
+      # without it juliapkg would resolve NoLimits by itself and the PYTHON_JULIAPKG_*
+      # pinning below could go too.
       - name: Build julia_env
         run: |
           julia -e 'import Pkg; Pkg.activate("julia_env");
-                    Pkg.add([Pkg.PackageSpec(name="NoLimits", version="0.2.6"),
-                             Pkg.PackageSpec(name="PythonCall"),
-                             Pkg.PackageSpec(name="CSV")]); Pkg.precompile()'
+                    Pkg.add(["NoLimits", "PythonCall", "CSV"]); Pkg.precompile()'
 
       # Editable install: nolimits_flower/__init__.py pins julia_env/ relative to the
       # package, which only resolves to the repo checkout when installed in place.

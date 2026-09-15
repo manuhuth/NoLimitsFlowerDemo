@@ -33,9 +33,7 @@ jobs:
       - name: Build julia_env
         run: |
           julia -e 'import Pkg; Pkg.activate("julia_env");
-                    Pkg.add([Pkg.PackageSpec(name="NoLimits", version="0.2.6"),
-                             Pkg.PackageSpec(name="PythonCall"),
-                             Pkg.PackageSpec(name="CSV")]); Pkg.precompile()'
+                    Pkg.add(["NoLimits", "PythonCall", "CSV"]); Pkg.precompile()'
 
       - name: Install Python packages
         run: |
